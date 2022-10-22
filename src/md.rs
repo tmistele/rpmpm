@@ -373,25 +373,6 @@ pub async fn md2htmlblocks<'a>(md: Vec<u8>, fpath: &Path, cwd: &'a Path) -> Resu
     // borrowed `RawValue`s so this should still be pretty fast?
     let doc: PandocDoc = serde_json::from_str(&doc)?;
 
-    // title block
-    let titledoc = PandocDoc {
-        pandoc_api_version: doc.pandoc_api_version,
-        blocks: vec![],
-        meta: {
-            let mut cloned = doc.meta.clone();
-            cloned.retain(|k, _| TITLEKEYS.contains(&k.as_str()));
-            cloned
-        }
-    };
-    let titlejson = serde_json::to_vec(&titledoc)?;
-    let titleblock = {
-        let mut hasher = DefaultHasher::new();
-        titlejson.hash(&mut hasher);
-        cwd.hash(&mut hasher);
-        let hash = hasher.finish();
-        json2titleblock(&titlejson, hash, cwd)
-    };
-
     // This does not work
     /*
     let htmlblocks = doc.blocks.iter().map(|block| {
@@ -411,16 +392,39 @@ pub async fn md2htmlblocks<'a>(md: Vec<u8>, fpath: &Path, cwd: &'a Path) -> Resu
         htmlblocks.push(htmlblock);
     }
 
-    // Don't await titleblock or htmlblocks before here so they can run in parallel
-    // 
+    // Don't await htmlblocks right away so they can run in parallel with titleblock
+    //
     // Note: The hot path during editing is (I think) most blocks = cached and one is
     // changed. Thus, all but one of the json2htmlblock calls will be cached.
     // So `tokio::spawn`ing them here is probably not worth it and will just
     // generate overhead?
-    let (mut htmlblocks, titleblock) = futures::try_join!(
-        futures::future::try_join_all(htmlblocks),
-        titleblock,
-    )?;
+    let htmlblocks = futures::future::try_join_all(htmlblocks);
+
+    let (mut htmlblocks, titleblock) = if doc.meta.contains_key("title") {
+
+        // add title block, if any
+        let titledoc = PandocDoc {
+            pandoc_api_version: doc.pandoc_api_version,
+            blocks: vec![],
+            meta: {
+                let mut cloned = doc.meta.clone();
+                cloned.retain(|k, _| TITLEKEYS.contains(&k.as_str()));
+                cloned
+            }
+        };
+        let titlejson = serde_json::to_vec(&titledoc)?;
+        let titleblock = {
+            let mut hasher = DefaultHasher::new();
+            titlejson.hash(&mut hasher);
+            cwd.hash(&mut hasher);
+            let hash = hasher.finish();
+            json2titleblock(&titlejson, hash, cwd)
+        };
+
+        futures::try_join!(htmlblocks, titleblock)?
+    } else {
+        (htmlblocks.await?, None)
+    };
 
     if let Some(titleblock) = titleblock {
         htmlblocks.insert(0, titleblock);
@@ -538,4 +542,15 @@ mod tests {
         assert_eq!(citeproc_msg["html"], std::str::from_utf8(&expected).unwrap());
     }
 
+    #[tokio::test]
+    async fn md2htmlblocks_title() {
+        let (md, cwd) = read_file("title.md");
+        let fpath = cwd.join("title.md");
+        let (new_content, _) = md2htmlblocks(md, fpath.as_path(), fpath.parent().unwrap()).await.unwrap();
+        let new_content: serde_json::Value = serde_json::from_str(&new_content).unwrap();
+
+        let (expected, _) = read_file("title-title.html");
+
+        assert_eq!(new_content["htmlblocks"][0][1], std::str::from_utf8(&expected).unwrap());
+    }
 }
