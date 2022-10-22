@@ -243,11 +243,18 @@ async fn monitorpipe(file: Option<tokio::fs::File>, pipe: PathBuf, peer_map: Pee
                 _start = std::time::Instant::now();
             }
 
+            // Don't add \0 to buf
+            let (received_0, data) = if data.last().unwrap() == &0 {
+                (true, &data[..data.len()-1])
+            } else {
+                (false, &data[..])
+            };
+
             println!("got data: {}", data.len());
             buf.extend_from_slice(&data);
 
             // Trigger on \0
-            if !data.is_empty() && data.last().unwrap() == &0 {
+            if received_0 {
                 println!("read pipe total = {:?}", _start.elapsed());
                 _start = std::time::Instant::now();
                 println!("GOT \\0 - total: {}", buf.len());
