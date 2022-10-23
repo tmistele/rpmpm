@@ -148,8 +148,13 @@ type Queue = Arc<Mutex<QueueStatus>>;
 
 async fn send_message_to_all_clients(peer_map: &PeerMap, msg: Message) -> Result<()> {
     let peers = peer_map.lock().unwrap();
-    for (_, ws_sink) in peers.iter() {
-        ws_sink.unbounded_send(msg.clone())?;
+    if peers.len() == 1 {
+        // Avoid clone in the common case with only one client
+        peers.values().next().unwrap().unbounded_send(msg)?;
+    } else {
+        for ws_sink in peers.values() {
+            ws_sink.unbounded_send(msg.clone())?;
+        }
     }
     Ok(())
 }
