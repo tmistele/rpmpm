@@ -26,8 +26,37 @@ use bytes::{Bytes, BytesMut};
 type Tx = UnboundedSender<Message>;
 type PeerMap = Arc<Mutex<HashMap<SocketAddr, Tx>>>;
 
-async fn handle_connection(peer_map: PeerMap, stream: TcpStream, addr: SocketAddr, secret: String) -> Result<()>  {
-    println!("incoming connectoin");
+async fn new_websocket_content(msg: String, home: &Path, peer_map: &PeerMap, queue: &Queue) -> Result<()> {
+    if !msg.starts_with("filepath:") {
+        println!("Received unknown TEXT message: {}", msg);
+        return Ok(());
+    }
+
+    let fpath = home.join(&msg[9..]);
+    match std::fs::read(&fpath) {
+        Ok(content) => {
+            let new_content = NewContent {
+                fpath: fpath,
+                md: content.into(),
+            };
+
+            println!("Got data from file {}", &msg[9..]);
+            submit_new_content(&peer_map, &queue, new_content);
+        },
+        Err(e) => {
+            println!("Could not load data from file {}", &msg[9..]);
+            let msg = serde_json::to_string(&ErrMsg { error: format!("{}", e)})?;
+            let msg = Message::text(msg);
+
+            println!("sending Err from filepath request to clients!");
+            send_message_to_all_clients(&peer_map, msg).await?;
+        }
+    };
+    Ok(())
+}
+
+async fn handle_connection(stream: TcpStream, addr: SocketAddr, secret: String, peer_map: PeerMap, queue: Queue, home: PathBuf) -> Result<()>  {
+    println!("incoming connection");
     let mut ws_stream = tokio_tungstenite::accept_async(stream)
         .await
         .expect("Error during the websocket handshake occurred");
@@ -50,15 +79,27 @@ async fn handle_connection(peer_map: PeerMap, stream: TcpStream, addr: SocketAdd
 
     let (outgoing, incoming) = ws_stream.split();
     
-    // Wait for stream close
-    let wait_incoming = incoming.try_for_each(|msg| {
-        // TODO: process file path request
-        // TODO: process citeproc request
-        println!("Received a message from {}: {}", addr, msg.to_text().unwrap());
-        future::ok(())
+    // Handle incoming messages from this client's websocket until stream closes
+    let wait_incoming = incoming.try_for_each(|msg| async {
+        if let Message::Text(msg) = msg {
+            if let Err(e) = new_websocket_content(msg, home.as_path(), &peer_map, &queue).await {
+                // All interesting errors should be handled by `new_websocket_content` itself and
+                // sent as `ErrMsg`s back to the clients. Only very weird errors can reach here,
+                // e.g. when another errors occurs when sending an `ErrMsg` to the clients.
+                //
+                // We cannot easily return these errors here. `try_for_each` requires a
+                // `tungstenite::error::Error`. We could abuse one of the codes from there if we
+                // really wanted to abort receiving connections from this client. Or use
+                // something other than `try_for_each`. But since the errors that can actually
+                // occur here are not necessarily fatal, just print them.
+                eprintln!("Error handling new websocket content: {}", e);
+            }
+        }
+
+        Ok(())
     });
 
-    // Wait for message and send to client
+    // Handle messages to be sent to this client and send them
     let wait_forward = rx.map(Ok).forward(outgoing);
 
     pin_mut!(wait_forward, wait_incoming);
@@ -82,13 +123,9 @@ async fn progressbar(peer_map: PeerMap) -> Result<()> {
         tokio::time::sleep(duration).await;
         i += 1;
         let msg = Message::text(serde_json::to_string(&StatusMsg{status: &" 🞄 ".repeat(i)})?);
-        {
-            let peers = peer_map.lock().unwrap();
-            for (_, ws_sink) in peers.iter() {
-                println!("sending PROGRESS to a client!!");
-                ws_sink.unbounded_send(msg.clone())?;
-            }
-        }
+
+        println!("sending PROGRESS to clients!");
+        send_message_to_all_clients(&peer_map, msg).await?;
     }
 }
 
@@ -108,6 +145,15 @@ struct QueueStatus {
 }
 
 type Queue = Arc<Mutex<QueueStatus>>;
+
+async fn send_message_to_all_clients(peer_map: &PeerMap, msg: Message) -> Result<()> {
+    let peers = peer_map.lock().unwrap();
+    for (_, ws_sink) in peers.iter() {
+        ws_sink.unbounded_send(msg.clone())?;
+    }
+    Ok(())
+}
+
 async fn process_new_content(peer_map: PeerMap, queue: Queue, mut new: NewContent) -> Result<()> {
     loop {
         // Process current content
@@ -126,13 +172,8 @@ async fn process_new_content(peer_map: PeerMap, queue: Queue, mut new: NewConten
             };
             let msg = Message::text(msg);
 
-            {
-                let peers = peer_map.lock().unwrap();
-                for (_, ws_sink) in peers.iter() {
-                    println!("sending to a client!!");
-                    ws_sink.unbounded_send(msg.clone())?;
-                }
-            }
+            println!("sending to clients!");
+            send_message_to_all_clients(&peer_map, msg).await?;
 
             // citeproc
             // Note: We await citeproc only after sending jsonmessage to client
@@ -141,12 +182,8 @@ async fn process_new_content(peer_map: PeerMap, queue: Queue, mut new: NewConten
                 let citeproc_json = citeproc_handle.await?;
                 let msg = Message::text(citeproc_json);
 
-                let peers = peer_map.lock().unwrap();
-                for (_, ws_sink) in peers.iter() {
-                    println!("sending CITEPROC to a client!!");
-                    ws_sink.unbounded_send(msg.clone())?;
-                }
-
+                println!("sending CITEPROC to clients!");
+                send_message_to_all_clients(&peer_map, msg).await?;
             }
         }
 
@@ -414,7 +451,7 @@ pub async fn run(args: crate::Args) -> Result<()> {
 
     // Handle websocket connections
     while let Ok((stream, addr)) = listener.accept().await {
-        tokio::spawn(handle_connection(peer_map.clone(), stream, addr, secret.clone()));
+        tokio::spawn(handle_connection(stream, addr, secret.clone(), peer_map.clone(), queue.clone(), home.clone()));
     }
 
     Ok(())
