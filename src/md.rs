@@ -16,6 +16,8 @@ use serde_tuple::Serialize_tuple;
 use lazy_static::lazy_static;
 use regex::{Regex as Regex, Replacer};
 
+use bytes::Bytes;
+
 type RawPandocBlock = serde_json::value::RawValue;
 type RawPandocApiVersion = serde_json::value::RawValue;
 
@@ -69,7 +71,7 @@ impl<'a> PandocDoc<'a> {
     cwd.hash(&mut hasher);
     hasher.finish()
 }")]
-async fn md2json(md: &Vec<u8>, cwd: &Path) -> Result<String> {
+async fn md2json(md: &Bytes, cwd: &Path) -> Result<String> {
     let mut cmd = Command::new("pandoc");
     cmd
         .current_dir(cwd)
@@ -364,7 +366,7 @@ struct NewContentMessage<'a> {
 const TITLEKEYS: &'static [&'static str] = &["title", "subtitle", "author", "date"];
 
 // no cache, checks for bib differences
-pub async fn md2htmlblocks<'a>(md: Vec<u8>, fpath: &Path, cwd: &'a Path) -> Result<(String, impl futures::Future<Output = Result<String> > + 'a)> {
+pub async fn md2htmlblocks<'a>(md: Bytes, fpath: &Path, cwd: &'a Path) -> Result<(String, impl futures::Future<Output = Result<String> > + 'a)> {
 
     let _start = std::time::Instant::now();
 
@@ -462,7 +464,7 @@ mod tests {
     
     use crate::md::*;
 
-    fn read_file(filename: &str) -> (Vec<u8>, PathBuf) {
+    fn read_file(filename: &str) -> (Bytes, PathBuf) {
         let filepath = PathBuf::from(format!(
             "{}/resources/tests/{}",
             std::env::var("CARGO_MANIFEST_DIR").unwrap(), filename));
@@ -472,9 +474,9 @@ mod tests {
             let mut decomp: Vec<u8> = Vec::new();
             lzma_rs::xz_decompress(&mut f, &mut decomp).unwrap();
 
-            (decomp, filepath.parent().unwrap().to_path_buf())
+            (decomp.into(), filepath.parent().unwrap().to_path_buf())
         } else {
-            (fs::read(&filepath).unwrap(), filepath.parent().unwrap().to_path_buf())
+            (fs::read(&filepath).unwrap().into(), filepath.parent().unwrap().to_path_buf())
         }
 
     }

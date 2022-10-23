@@ -21,6 +21,8 @@ use tokio_tungstenite::tungstenite::protocol::Message;
 
 use serde::Serialize;
 
+use bytes::{Bytes, BytesMut};
+
 type Tx = UnboundedSender<Message>;
 type PeerMap = Arc<Mutex<HashMap<SocketAddr, Tx>>>;
 
@@ -97,7 +99,7 @@ struct ErrMsg {
 
 struct NewContent {
     fpath: PathBuf,
-    md: Vec<u8>,
+    md: Bytes,
 }
 
 struct QueueStatus {
@@ -191,37 +193,77 @@ fn submit_new_content(peer_map: &PeerMap, queue: &Queue, new: NewContent) {
     tokio::spawn(process_new_content(peer_map.clone(), queue.clone(), new));
 }
 
+struct NewPipeContentCodec<'a> {
+    home: &'a Path
+}
 
-fn new_pipe_content(peer_map: &PeerMap, queue: &Queue, home: &Path, buf: &bytes::BytesMut) -> Result<()> {
-    // parse '<!-- filepath:... -->\n'
-    let (content, fpath) = if buf.starts_with(b"<!-- filepath:") {
-        let lineend = &buf[14..].iter().position(|&x| x == b'\n');
-        if let Some(lineend) = lineend {
-            let split = 14+*lineend+1;
-            (&buf[split..], home.join(std::str::from_utf8(&buf[14..split-5])?))
-        } else {
-            (&buf[..], home.join("LIVE"))
+impl NewPipeContentCodec<'_> {
+
+    fn new<'a>(home: &'a Path) -> NewPipeContentCodec<'a> {
+        NewPipeContentCodec {
+            home: home
         }
-    } else {
-        (&buf[..], home.join("LIVE"))
-    };
+    }
 
-    let new = NewContent {
-        fpath: fpath,
-        md: content.to_vec()
-    };
+    fn parse_pipe_content(&self, mut buf: BytesMut) -> Result<NewContent> {
+        let home = self.home;
+        // parse '<!-- filepath:... -->\n'
+        let (content, fpath) = if buf.starts_with(b"<!-- filepath:") {
+            let lineend = &buf[14..].iter().position(|&x| x == b'\n');
+            if let Some(lineend) = lineend {
+                let split = 14+*lineend+1;
+                let fpath = home.join(std::str::from_utf8(&buf[14..split-5])?);
+                (buf.split_off(split), fpath)
+            } else {
+                (buf, home.join("LIVE"))
+            }
+        } else {
+            (buf, home.join("LIVE"))
+        };
 
-    submit_new_content(peer_map, queue, new);
+        Ok(NewContent {
+            fpath: fpath,
+            md: content.freeze()
+        })
+    }
+}
 
-    Ok(())
+impl tokio_util::codec::Decoder for NewPipeContentCodec<'_> {
+    type Item = NewContent;
+    type Error = anyhow::Error;
+
+    fn decode(&mut self, buf: &mut BytesMut) -> Result<Option<Self::Item>> {
+        if !buf.is_empty() {
+            if buf.last().unwrap() == &0 {
+                println!("got data, len = {}, emitting new content", buf.len()-1);
+                // First take out complete buffer
+                let mut buf = buf.split();
+                let len = buf.len();
+                // Then omit last byte since we don't want to \0
+                let new_content = self.parse_pipe_content(buf.split_to(len-1))?;
+                Ok(Some(new_content))
+            } else {
+                println!("got data, len = {}, but waiting for \\0", buf.len());
+                Ok(None)
+            }
+        } else {
+            Ok(None)
+        }
+    }
+
+    fn decode_eof(&mut self, buf: &mut BytesMut) -> Result<Option<Self::Item>> {
+        if buf.is_empty() {
+            Ok(None)
+        } else {
+            let len = buf.len();
+            println!("got eof - giving out len = {}", len);
+            let new_content = self.parse_pipe_content(buf.split_to(len))?;
+            Ok(Some(new_content))
+        }
+    }
 }
 
 async fn monitorpipe(file: Option<tokio::fs::File>, pipe: PathBuf, peer_map: PeerMap, queue: Queue, home: PathBuf) -> Result<()> {
-
-    // TODO: increase pipe buf size? (match 65_535?)
-
-    let mut buf = bytes::BytesMut::with_capacity(65_535);
-    let mut _start = std::time::Instant::now();
 
     // Start with pre-opened file from systemd fd, if any
     let mut file = if let Some(file) = file {
@@ -235,48 +277,12 @@ async fn monitorpipe(file: Option<tokio::fs::File>, pipe: PathBuf, peer_map: Pee
     };
 
     loop {
-        let mut pipe_stream = tokio_util::codec::FramedRead::new(file, tokio_util::codec::BytesCodec::new());
+        let mut pipe_stream = tokio_util::codec::FramedRead::with_capacity(
+            file, NewPipeContentCodec::new(&home), 65_536);
         while let Some(read) = pipe_stream.next().await {
-            let data = read?;
-            if buf.len() == 0 {
-                println!("start reading into new buf...");
-                _start = std::time::Instant::now();
-            }
-
-            // Don't add \0 to buf
-            let (received_0, data) = if data.last().unwrap() == &0 {
-                (true, &data[..data.len()-1])
-            } else {
-                (false, &data[..])
-            };
-
-            println!("got data: {}", data.len());
-            buf.extend_from_slice(&data);
-
-            // Trigger on \0
-            if received_0 {
-                println!("read pipe total = {:?}", _start.elapsed());
-                _start = std::time::Instant::now();
-                println!("GOT \\0 - total: {}", buf.len());
-
-                new_pipe_content(&peer_map, &queue, &home, &buf)?;
-
-                // Take previous size as new estimate
-                buf = bytes::BytesMut::with_capacity(buf.len());
-            }
-        };
-
-        // Also trigger on EOF
-        println!("got EOF - total: {}", buf.len());
-        if !buf.is_empty() {
-            println!("read pipe total = {:?}", _start.elapsed());
-            _start = std::time::Instant::now();
-            println!("GOT EOF - total: {}", buf.len());
-
-            new_pipe_content(&peer_map, &queue, &home, &buf)?;
-
-            // Take previous size as new estimate
-            buf = bytes::BytesMut::with_capacity(buf.len());
+            let new_content = read?;
+            println!("got new content!");
+            submit_new_content(&peer_map, &queue, new_content);
         }
 
         // Reopen file
