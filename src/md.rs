@@ -253,12 +253,7 @@ fn mtime_from_meta_bibliography(bibliography: &serde_json::Map<String, serde_jso
 
 async fn uniqueciteprocdict(doc: &PandocDoc<'_>, htmlblocks: &Vec<Htmlblock>, cwd: &Path) -> Result<Option<Vec<u8>>> {
     // collect all cite blocks
-    let mut citeblocks = Vec::new();
-    for block in htmlblocks {
-        for citeblock in &block.citeblocks {
-            citeblocks.push(citeblock);
-        }
-    }
+    let citeblocks = htmlblocks.iter().map(|b| &b.citeblocks).flatten().collect::<Vec<&serde_json::Value>>();
 
     let mut doc = PandocDocNonRawBlocks {
         pandoc_api_version: doc.pandoc_api_version,
@@ -375,24 +370,14 @@ pub async fn md2htmlblocks<'a>(md: Bytes, fpath: &Path, cwd: &'a Path) -> Result
     // borrowed `RawValue`s so this should still be pretty fast?
     let doc: PandocDoc = serde_json::from_str(&doc)?;
 
-    // This does not work
-    /*
     let htmlblocks = doc.blocks.iter().map(|block| {
-        json2htmlblock(doc.pandoc_api_version, block)
-    });
-    */
-    // This does ... ?! something about ownership and closures I don't understand?
-    let mut htmlblocks = Vec::with_capacity(doc.blocks.len());
-    for block in &doc.blocks {
-
         let mut hasher = DefaultHasher::new();
         block.get().hash(&mut hasher);
         cwd.hash(&mut hasher);
         let hash = hasher.finish();
 
-        let htmlblock = json2htmlblock(doc.pandoc_api_version, block, hash, cwd);
-        htmlblocks.push(htmlblock);
-    }
+        json2htmlblock(doc.pandoc_api_version, block, hash, cwd)
+    });
 
     // Don't await htmlblocks right away so they can run in parallel with titleblock
     //
