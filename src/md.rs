@@ -184,7 +184,7 @@ async fn json2htmlblock(pandoc_api_version: &RawPandocApiVersion, block: &RawPan
         out = new;
     }
 
-    // find citecproc elements
+    // find citeproc elements
     let parsed_block: serde_json::Value = serde_json::from_str(block.get())?;
 
     let mut citeblocks: Vec<serde_json::Value> = Vec::new();
@@ -331,8 +331,6 @@ async fn citeproc(bibid: Option<u64>, citeproc_input: Option<Vec<u8>>, cwd: &Pat
     } else {
         "".to_string()
     };
-
-    println!("citeproc reuslt length = {}", out.len());
 
     let message = NewCiteprocMessage {
         bibid: bibid,
@@ -520,12 +518,18 @@ mod tests {
     async fn md2htmlblocks_twobibs_toc_relative_link() {
         let (md, cwd) = read_file("two-bibs-toc-relative-link.md");
         let fpath = cwd.join("citations.md");
-        let (_, citeproc_handle) = md2htmlblocks(md, fpath.as_path(), fpath.parent().unwrap()).await.unwrap();
+        let (json, citeproc_handle) = md2htmlblocks(md, fpath.as_path(), fpath.parent().unwrap()).await.unwrap();
+
+        let json: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let (expected, _) = read_file("two-bibs-toc-relative-link-linkblock.html");
+        assert_eq!(
+            json.get("htmlblocks").unwrap().as_array().unwrap()[4].as_array().unwrap()[1].as_str().unwrap().trim_end(),
+            std::str::from_utf8(&expected).unwrap().replace("{cwd}", cwd.to_str().unwrap()).trim_end()
+        );
+
         let citeproc_out = citeproc_handle.await.unwrap();
         let citeproc_msg: serde_json::Value = serde_json::from_str(&citeproc_out).unwrap();
-
         let (expected, _) = read_file("two-bibs-toc-relative-link-citeproc.html");
-
         assert_eq!(citeproc_msg["html"], std::str::from_utf8(&expected).unwrap());
     }
 

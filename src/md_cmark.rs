@@ -1,0 +1,762 @@
+use anyhow::{Context, Result, anyhow};
+
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
+use std::fmt::Write;
+use std::path::{Path, PathBuf};
+
+use cached::proc_macro::cached;
+
+use serde::{Deserialize, Serialize};
+use serde_tuple::Serialize_tuple;
+
+use tokio::io::AsyncWriteExt;
+use tokio::process::Command;
+
+use lazy_static::lazy_static;
+use regex::{Regex as Regex, Replacer};
+
+use bytes::Bytes;
+
+struct ParsedBlock<'a> {
+    footnote_references: Vec<pulldown_cmark::CowStr<'a>>,
+    link_references: Vec<&'a str>,
+    range: core::ops::Range<usize>,
+}
+
+type Metadata = std::collections::HashMap<String, serde_yaml::Value>;
+
+#[derive(Clone)]
+struct SplitMarkdown {
+    metadata: Metadata,
+    blocks: Vec<String>
+}
+
+impl<'a> SplitMarkdown {
+    fn get_meta_flag(&self, name: &str) -> bool {
+        if let Some(val) = self.metadata.get(name) {
+            if let serde_yaml::Value::Bool(val) = val {
+                *val
+            } else {
+                false
+            }
+        } else {
+            false
+        }
+    }
+
+    fn get_meta_str(&'a self, name: &str) -> Option<&'a str> {
+        if let Some(val) = self.metadata.get(name) {
+            if let serde_yaml::Value::String(val) = val {
+                Some(val)
+            } else {
+                None
+            }
+        } else {
+            None
+        }
+    }
+}
+
+fn try_parse_yaml_metadata_block(md: &str, start: usize) -> Option<(usize, Metadata)> {
+
+    // See https://pandoc.org/MANUAL.html#extension-yaml_metadata_block
+    
+    // Not enough space to even contain a ---\n---
+    if start + 7 > md.len() {
+        return None
+    }
+
+    // It must be exactly three --- followed by newline
+    if &md[start..start+4] != "---\n" {
+        return None
+    }
+
+    // If initial --- is not at the beginning of the document, it must be preceded by a blank line
+    if start > 1 && &md[start-2..start] != "\n\n" {
+        return None
+    }
+
+    // The initial --- must not be followed by a blank line
+    if &md[start+3..start+5] == "\n\n" {
+        return None
+    }
+    
+    // It must end with \n---\n or \n...\n
+    // TODO: avoid scanning to end for nothing if it's \n...\n?
+    let length = md[start+4..].find("\n---\n").or_else(|| md[start+4..].find("\n...\n"))?;
+    let end = start+4+length;
+
+    // It must be valid yaml
+    let yaml = serde_yaml::from_str(&md[start+4..end]).ok()?;
+
+    Some((end+5, yaml))
+}
+
+#[cached(result=true, size=10, key="u64", convert="{
+    let mut hasher = DefaultHasher::new();
+    md.hash(&mut hasher);
+    hasher.finish()
+}")]
+async fn md2mdblocks(md: &str) -> Result<SplitMarkdown> {
+    // TODO: Can there be nested FootenoteDefinitions? I don't think so
+
+    // TODO: Manualy parse title block with % prefix?
+    
+    let mut options = pulldown_cmark::Options::empty();
+    options.insert(pulldown_cmark::Options::ENABLE_FOOTNOTES);
+
+    let parser = pulldown_cmark::Parser::new_ext(md, options);
+
+    // TODO: Pandoc incompatibilty? Two footnote definitions without hard break
+    //
+    // Works in pandoc but not pulldown-cmark
+    //
+    // [^1]: asdf
+    // [^4]: bsdf
+    //
+    // Works in both
+    //
+    // [^1]: asdf
+    // 
+    // [^4]: bsdf
+
+    // Extract reference definitions, i.e. things like [foo]: http://www.example.com/
+    // TODO: can I do w/o clone + to_owned() here?
+    let link_reference_definitions: std::collections::HashMap<_, _> = parser.reference_definitions().iter().map(|(label, def)| (label.to_owned(), def.span.clone())).collect();
+
+    let mut metadata: Option<Metadata> = None;
+
+    let mut blocks = Vec::new(); // TODO: capacity? guess from last one?
+    let mut current_block_footnote_references = Vec::new();
+    let mut current_block_link_references = Vec::new();
+
+    let mut footnote_definitions = std::collections::HashMap::new();
+
+    let mut level = 0;
+    let mut skip_until = 0;
+    for (event, range) in parser.into_offset_iter() {
+
+        // Maybe skip yaml metadata block we have parsed ourselves.
+        if range.start < skip_until {
+            continue;
+        }
+
+        match event {
+
+            pulldown_cmark::Event::Start(pulldown_cmark::Tag::FootnoteDefinition(_)) => {
+                level += 1;
+            },
+            pulldown_cmark::Event::End(pulldown_cmark::Tag::FootnoteDefinition(ref label)) => {
+                footnote_definitions.insert(label.clone(), range);
+                level -= 1;
+            },
+
+            pulldown_cmark::Event::Start(_) => {
+                level += 1;
+            },
+            pulldown_cmark::Event::End(tag) => {
+                level -= 1;
+
+                if let pulldown_cmark::Tag::Link(pulldown_cmark::LinkType::Reference, _, _) |
+                       pulldown_cmark::Tag::Link(pulldown_cmark::LinkType::Shortcut, _, _) = tag {
+                    // TODO: ensure last is "]"
+                    let mut end = range.end;
+                    loop {
+                        end = range.start + md[range.start..end].rfind("[").context("Missing [ in reference")?;
+                        // label can contain ], it just has to be escaped as \]
+                        if end == 0 || ! &md[end-1..].starts_with("\\") {
+                            break;
+                        }
+                    }
+                    let label = &md[end+1..range.end-1];
+                    current_block_link_references.push(label);
+                }
+
+                if level == 0 {
+                    blocks.push(ParsedBlock {
+                        footnote_references: current_block_footnote_references,
+                        link_references: current_block_link_references,
+                        range: range,
+                    });
+                    current_block_footnote_references = Vec::new();
+                    current_block_link_references = Vec::new();
+                }
+            },
+
+            pulldown_cmark::Event::FootnoteReference(ref label) => {
+                // TODO: Can this happen inside another footnote? I don't think so??
+                current_block_footnote_references.push(label.clone());
+            },
+
+            pulldown_cmark::Event::Rule if level == 0 => {
+                // A Rule may indicate a yaml metadata block
+                if let Some((yaml_end, parsed_yaml)) = try_parse_yaml_metadata_block(md, range.start) {
+                    if let Some(ref mut metadata) = metadata {
+                        // A second/third/... metadata block. Merge it into the existing one
+                        for (key, value) in parsed_yaml.into_iter() {
+                            metadata.insert(key, value);
+                        }
+                    } else {
+                        // First metadata block, use it directly
+                        metadata = Some(parsed_yaml);
+                    }
+                    skip_until = yaml_end
+                } else {
+                    // A top-level Rule
+                    blocks.push(ParsedBlock {
+                        footnote_references: Vec::new(),
+                        link_references: Vec::new(),
+                        range: range,
+                    });
+                }
+            },
+
+            _ => if level == 0 {
+                // A single-event top-level block, e.g. a Rule
+                // TODO: can this happen actually? Rule is handled separately now...
+                blocks.push(ParsedBlock {
+                    footnote_references: Vec::new(),
+                    link_references: Vec::new(),
+                    range: range,
+                });
+            }
+        }
+    }
+
+    // TODO: save source locations, at least at block-level? -- maybe we can use these to
+    //       implement "jump to block" in editor?
+
+    // TODO: pmpm right now = references to same footnote in different blocks = footnote appears
+    //       twice. Here, we maybe can improve on this since we anyway parse the thing?
+
+    // TODO: referencing footnotes in `title: ...` does not work (also doesn't work in normal pmpm)
+
+    let blocks = blocks.iter().map(|block| {
+        let length = (block.range.end - block.range.start) + 1
+            + block.link_references
+                .iter()
+                .map(|label| link_reference_definitions.get(*label)
+                    .map_or(0, |range| range.end - range.start + 1)).sum::<usize>()
+            + block.footnote_references
+                .iter()
+                .map(|label| footnote_definitions.get(label)
+                    .map_or(0, |range| range.end - range.start)).sum::<usize>();
+
+        let mut buf = String::with_capacity(length);
+        // block content
+        write!(buf, "{}\n", &md[block.range.start..block.range.end])?;
+        // add definitions
+        for label in &block.link_references {
+            // don't just unwrap in case of missing definition (common while typing!)
+            if let Some(range) = link_reference_definitions.get(*label) {
+                write!(buf, "{}\n", &md[range.start..range.end])?;
+            }
+        }
+        // add footnotes
+        for label in &block.footnote_references {
+            // don't just unwrap in case of missing definition (common while typing!)
+            if let Some(range) = footnote_definitions.get(label) {
+                write!(buf, "{}", &md[range.start..range.end])?;
+            }
+        }
+
+        Ok(buf)
+    }).collect::<Result<Vec<_>>>()?;
+
+    Ok(SplitMarkdown {
+        metadata: metadata.unwrap_or_else(|| std::collections::HashMap::new()),
+        blocks: blocks,
+    })
+}
+
+fn get_citeblocks(block: &serde_json::Value, list: &mut Vec<serde_json::Value>) -> () {
+    match block {
+        serde_json::Value::Object(map) => {
+            if let Some(ty) = map.get("t") {
+                if ty == "Cite" {
+                    list.push(serde_json::json!({"t": "Para", "c": [block.clone()]}));
+                    return;
+                }
+            }
+
+            for block in map.values() {
+                get_citeblocks(block, list);
+            }
+
+        },
+        serde_json::Value::Array(vec) => {
+            for block in vec {
+                get_citeblocks(block, list);
+            }
+        },
+        _ => {}
+    };
+}
+
+#[derive(Serialize_tuple, Clone)]
+struct Htmlblock {
+    hash: u64,
+    html: String,
+    #[serde(skip_serializing)]
+    citeblocks: Vec<serde_json::Value>,
+}
+
+#[cached(result=true, size=8192, key="u64", convert="{hash}")]
+async fn mdblock2htmlblock(md_block: &str, hash: u64, cwd: &Path) -> Result<Htmlblock> {
+
+    // First convert html to json
+    // This intermediate json step is only used to we can easily extract citeblocks from json
+    // TODO: can we somehow omit this? directly parse citeblocks? or extract citeblocks from
+    //       resulting html?
+    let mut cmd = Command::new("pandoc");
+    cmd
+        .current_dir(cwd)
+        .arg("--from").arg("markdown+emoji")
+        .arg("--to").arg("json")
+        .arg("--katex");
+
+    cmd.stdout(std::process::Stdio::piped());
+    cmd.stdin(std::process::Stdio::piped());
+
+    let mut child = cmd.spawn()?;
+    let mut stdin = child.stdin.take().expect("stdin take failed");
+
+    stdin.write_all(md_block.as_bytes()).await?;
+
+    // Send EOF to child
+    drop(stdin);
+
+    let raw_json = child.wait_with_output().await?.stdout;
+
+    // Then convert json to html
+    let mut cmd = Command::new("pandoc");
+    cmd
+        .current_dir(cwd)
+        .arg("--from").arg("json")
+        .arg("--to").arg("html5")
+        .arg("--katex");
+
+    cmd.stdout(std::process::Stdio::piped());
+    cmd.stdin(std::process::Stdio::piped());
+
+    let mut child = cmd.spawn()?;
+    let mut stdin = child.stdin.take().expect("stdin take failed");
+
+    stdin.write_all(&raw_json).await?;
+
+    // Send EOF to child
+    drop(stdin);
+
+    let out = child.wait_with_output().await?;
+    let mut out = String::from_utf8(out.stdout)?;
+
+    // Replace relative local URLs
+    // Alternative is fancy_regex which supports negative backtracking.
+    // But this here is faster for the common case where there are only few local links.
+    lazy_static! {
+        static ref URL_REGEX: Regex = Regex::new(r#"(href|src)=['"](.+?)['"]"#).unwrap();
+        static ref URL_REGEX_EXCLUDE_PREFIX: Regex = Regex::new(r##"^/|https://|http://|\#"##).unwrap();
+    }
+    let captures: Vec<regex::Captures> = URL_REGEX.captures_iter(&out)
+        .filter(|c| !URL_REGEX_EXCLUDE_PREFIX.is_match(c.get(2).unwrap().as_str()))
+        .collect();
+    if !captures.is_empty() {
+        let mut rep = format!(
+            r#"$1="file://{}/$2" onclick="return localLinkClickEvent(this);""#,
+            cwd.to_str().context("cwd not a string")?
+        );
+
+        let mut new = String::with_capacity(out.len());
+        let mut last_match = 0;
+        for cap in captures {
+            let m = cap.get(0).unwrap();
+            new.push_str(&out[last_match..m.start()]);
+            rep.replace_append(&cap, &mut new);
+            last_match = m.end();
+        }
+        new.push_str(&out[last_match..]);
+        out = new;
+    }
+
+    // find citeproc elements
+    let parsed_block: serde_json::Value = serde_json::from_slice(&raw_json)?;
+
+    let mut citeblocks: Vec<serde_json::Value> = Vec::new();
+    get_citeblocks(&parsed_block, &mut citeblocks);
+
+    Ok(Htmlblock {
+        html: out,
+        citeblocks: citeblocks,
+        hash: hash
+    })
+}
+
+const BIBKEYS: &'static [&'static str] = &["bibliography", "csl", "link-citations", "nocite", "references"];
+
+fn mtime_from_meta_bibliography(bibliography: &serde_json::Map<String, serde_json::Value>, cwd: &Path) -> Result<u64> {
+    if let serde_json::Value::String(bibfile) = &bibliography["c"][0]["c"] {
+        let bibfile = cwd.join(PathBuf::from(bibfile));
+        let mtime = std::fs::metadata(bibfile)?.modified()?.duration_since(std::time::SystemTime::UNIX_EPOCH)?.as_secs();
+        return Ok(mtime);
+    } else {
+        Err(anyhow!("Unexpected json structure in bibliography"))
+    }
+}
+
+type RawPandocBlock = serde_json::value::RawValue;
+type RawPandocApiVersion = serde_json::value::RawValue;
+
+#[derive(Serialize, Debug)]
+struct PandocDocNonRawBlocks<'a> {
+    #[serde(rename = "pandoc-api-version")]
+    pandoc_api_version: &'a RawPandocApiVersion,
+    meta: serde_json::Map<String, serde_json::Value>,
+    blocks: Vec<&'a serde_json::Value>,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+struct PandocDoc<'a> {
+    #[serde(rename = "pandoc-api-version")]
+    pandoc_api_version: &'a RawPandocApiVersion,
+    meta: serde_json::Map<String, serde_json::Value>,
+    #[serde(borrow)]
+    blocks: Vec<&'a RawPandocBlock>,
+}
+
+async fn uniqueciteprocdict(split_md: &SplitMarkdown, htmlblocks: &Vec<Htmlblock>, cwd: &Path) -> Result<Option<Vec<u8>>> {
+
+    let mut cloned_yaml_metadata = split_md.metadata.clone();
+    cloned_yaml_metadata.retain(|k, _| BIBKEYS.contains(&k.as_str()));
+
+    // No bib
+    if cloned_yaml_metadata.len() <= 0 {
+        return Ok(None);
+    }
+
+    // collect all cite blocks
+    let citeblocks = htmlblocks.iter().map(|b| &b.citeblocks).flatten().collect::<Vec<&serde_json::Value>>();
+
+    // yaml metadata to pandoc json format
+    // TODO: do better? could do this for one of the blocks? or at least cache the result?
+    //       or get rid of it entirely if we parse citeblocks from html?
+
+    let mut cmd = Command::new("pandoc");
+    cmd
+        .current_dir(cwd)
+        .arg("--from").arg("markdown+emoji")
+        .arg("--to").arg("json")
+        .arg("--katex");
+
+    cmd.stdout(std::process::Stdio::piped());
+    cmd.stdin(std::process::Stdio::piped());
+
+    let mut child = cmd.spawn()?;
+    let mut stdin = child.stdin.take().expect("stdin take failed");
+
+    stdin.write_all(b"---\n").await?;
+    stdin.write_all(&serde_yaml::to_string(&cloned_yaml_metadata)?.as_bytes()).await?;
+    stdin.write_all(b"\n---\n").await?;
+
+    // Send EOF to child
+    drop(stdin);
+
+    let json = child.wait_with_output().await?.stdout;
+    let doc: PandocDoc = serde_json::from_slice(&json)?;
+
+    let mut doc = PandocDocNonRawBlocks {
+        pandoc_api_version: doc.pandoc_api_version,
+        blocks: citeblocks,
+        meta: doc.meta,
+    };
+
+    // .bib mtimes
+    if let Some(serde_json::Value::Object(bibliography)) = doc.meta.get_mut("bibliography") {
+
+        if bibliography["t"] == "MetaInlines" {
+            let mtime = mtime_from_meta_bibliography(bibliography, cwd)?;
+            bibliography.insert("bibliography_mtimes_".to_string(), serde_json::json!(mtime));
+        } else if let serde_json::Value::Array(bibs) = &bibliography["c"] {
+            let mtimes = bibs.iter().map(|bibliography| {
+                    let bibliography = if let serde_json::Value::Object(x) = bibliography { x } else { return Err(anyhow!("bibliography not an Object")) };
+                    let mtime = mtime_from_meta_bibliography(bibliography, cwd)?;
+                    Ok::<serde_json::Value, anyhow::Error>(serde_json::json!(mtime))
+                })
+                .collect::<Result<Vec<serde_json::Value>>>()?;
+            bibliography.insert("bibliography_mtimes_".to_string(), serde_json::Value::Array(mtimes));
+        }
+    }
+
+    if let Some(serde_json::Value::Object(csl)) = doc.meta.get_mut("csl") {
+        let mtime = mtime_from_meta_bibliography(&csl, cwd)?;
+            csl.insert("csl_mtime_".to_string(), serde_json::json!(mtime));
+    }
+
+
+    let json = serde_json::to_vec(&doc)?;
+    Ok(Some(json))
+}
+
+#[derive(Serialize)]
+struct NewCiteprocMessage<'a> {
+    html: &'a str,
+    bibid: Option<u64>,
+}
+
+#[cached(result=true, size=8192, key="Option<u64>", convert="{bibid}")]
+async fn citeproc(bibid: Option<u64>, citeproc_input: Option<Vec<u8>>, cwd: &Path) -> Result<String> {
+
+    let out = if let Some(citeproc_input) = citeproc_input {
+        let mut cmd = Command::new("pandoc");
+        cmd.current_dir(cwd)
+            .arg("--from").arg("json")
+            .arg("--to").arg("html5")
+            .arg("--katex")
+            .arg("--citeproc");
+
+        cmd.stdout(std::process::Stdio::piped());
+        cmd.stdin(std::process::Stdio::piped());
+
+        let mut child = cmd.spawn()?;
+        let mut stdin = child.stdin.take().expect("stdin take failed");
+
+        stdin.write_all(&citeproc_input).await?;
+
+        // Send EOF to child
+        drop(stdin);
+
+        let out = child.wait_with_output().await?;
+        String::from_utf8(out.stdout)?
+    } else {
+        "".to_string()
+    };
+
+    let message = NewCiteprocMessage {
+        bibid: bibid,
+        html: &out,
+    };
+
+    let jsonmessage = serde_json::to_string(&message)?;
+    Ok(jsonmessage)
+}
+
+#[derive(Serialize)]
+struct NewContentMessage<'a> {
+    filepath: &'a str,
+    htmlblocks: &'a Vec<Htmlblock>,
+    bibid: Option<u64>,
+    #[serde(rename = "suppress-bibliography")]
+    suppress_bibliography: bool,
+    toc: bool,
+    #[serde(rename = "toc-title")]
+    toc_title: Option<&'a str>,
+    #[serde(rename = "reference-section-title")]
+    reference_section_title: &'a str,
+}
+
+// no cache, checks for bib differences
+pub async fn md2htmlblocks<'a>(md: Bytes, fpath: &Path, cwd: &'a Path) -> Result<(String, impl futures::Future<Output = Result<String> > + 'a)> {
+
+    let _start = std::time::Instant::now();
+
+    let split_md = md2mdblocks(std::str::from_utf8(&md)?).await?;
+    let htmlblocks = split_md.blocks.iter().map(|block| {
+        let mut hasher = DefaultHasher::new();
+        block.hash(&mut hasher);
+        cwd.hash(&mut hasher);
+        let hash = hasher.finish();
+
+        mdblock2htmlblock(block, hash, cwd)
+    });
+
+    // Don't await htmlblocks right away so they can run in parallel with titleblock
+    //
+    // Note: The hot path during editing is (I think) most blocks = cached and one is
+    // changed. Thus, all but one of the json2htmlblock calls will be cached.
+    // So `tokio::spawn`ing them here is probably not worth it and will just
+    // generate overhead?
+    let htmlblocks = futures::future::try_join_all(htmlblocks);
+
+    /*
+    let (mut htmlblocks, titleblock) = if doc.meta.contains_key("title") {
+
+        // add title block, if any
+        let titledoc = PandocDoc {
+            pandoc_api_version: doc.pandoc_api_version,
+            blocks: vec![],
+            meta: {
+                let mut cloned = doc.meta.clone();
+                cloned.retain(|k, _| TITLEKEYS.contains(&k.as_str()));
+                cloned
+            }
+        };
+        let titlejson = serde_json::to_vec(&titledoc)?;
+        let titleblock = {
+            let mut hasher = DefaultHasher::new();
+            titlejson.hash(&mut hasher);
+            cwd.hash(&mut hasher);
+            let hash = hasher.finish();
+            json2titleblock(&titlejson, hash, cwd)
+        };
+
+        futures::try_join!(htmlblocks, titleblock)?
+    } else {
+        (htmlblocks.await?, None)
+    };
+    // TODO: titleblock
+    */
+    let (mut htmlblocks, titleblock) = (htmlblocks.await?, None);
+
+    if let Some(titleblock) = titleblock {
+        htmlblocks.insert(0, titleblock);
+    }
+
+    let citejson = uniqueciteprocdict(&split_md, &htmlblocks, cwd).await?;
+    let bibid = if let Some(ref citejson) = citejson {
+        let mut hasher = DefaultHasher::new();
+        citejson.hash(&mut hasher);
+        cwd.hash(&mut hasher);
+        Some(hasher.finish())
+    } else {
+        None
+    };
+
+    // Message to be sent to browser
+    let message = NewContentMessage {
+        filepath: fpath.to_str().context("could not convert filepath to str")?, // TODO: relative to cwd?
+        htmlblocks: &htmlblocks,
+        bibid: bibid,
+        suppress_bibliography: split_md.get_meta_flag("suppress-bibliography"),
+        toc: split_md.get_meta_flag("toc"),
+        toc_title: split_md.get_meta_str("toc-title"),
+        reference_section_title: split_md.get_meta_str("reference-section-title").unwrap_or(""),
+    };
+
+    println!("md2htmlblocks (cmark) total = {:?}", _start.elapsed());
+
+    let jsonmessage = serde_json::to_string(&message)?;
+    Ok((jsonmessage, citeproc(bibid, citejson, cwd)))
+}
+
+
+#[cfg(test)]
+mod tests {
+    
+    use crate::md_cmark::*;
+
+    fn read_file(filename: &str) -> (Bytes, PathBuf) {
+        let filepath = PathBuf::from(format!(
+            "{}/resources/tests/{}",
+            std::env::var("CARGO_MANIFEST_DIR").unwrap(), filename));
+
+        if filename.ends_with(".xz") {
+            let mut f = std::io::BufReader::new(std::fs::File::open(&filepath).unwrap());
+            let mut decomp: Vec<u8> = Vec::new();
+            lzma_rs::xz_decompress(&mut f, &mut decomp).unwrap();
+
+            (decomp.into(), filepath.parent().unwrap().to_path_buf())
+        } else {
+            (std::fs::read(&filepath).unwrap().into(), filepath.parent().unwrap().to_path_buf())
+        }
+    }
+
+    #[tokio::test]
+    async fn split_md_metadata_block_at_start_with_one_newline() {
+        let md = "\n---\ntoc: true\n---\n";
+        assert_eq!(md2mdblocks(md).await.unwrap().metadata.get("toc"), Some(&serde_yaml::Value::Bool(true)));
+
+        let md = "\n\n---\ntoc: true\n---\n";
+        assert_eq!(md2mdblocks(md).await.unwrap().metadata.get("toc"), Some(&serde_yaml::Value::Bool(true)));
+
+        let md = "\nasdf\n---\ntoc: true\n---\n";
+        assert_eq!(md2mdblocks(md).await.unwrap().metadata.get("toc"), None);
+
+        let md = "asdf\n---\ntoc: true\n---\n";
+        assert_eq!(md2mdblocks(md).await.unwrap().metadata.get("toc"), None);
+    }
+
+    #[tokio::test]
+    async fn split_md_footnote_links() {
+        let (md, _) = read_file("footnotes-links.md");
+        let md = std::str::from_utf8(&md).unwrap();
+        let split = md2mdblocks(md).await.unwrap();
+        assert_eq!(split.blocks.len(), 5);
+        assert_eq!(split.blocks[2].trim_end(), "---");
+        assert_eq!(
+            split.blocks[3].trim_end(),
+            "test [^1] [another][link_with_title_andbracket\\[_name] goes here [^4]\n\n\
+                [link_with_title_andbracket\\[_name]: https://github.com/two \"title with \\\"quotes\\\" asdf\"\n\
+                [^1]: content of footnote\n\
+                \n\
+                [^4]: footnote with $x\\\\y=1$ math and stuff $\\frac12 = x$");
+        assert_eq!(split.metadata.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn split_md_multiple_metablocks() {
+        let (md, _) = read_file("multiple-metablocks.md");
+        let md = std::str::from_utf8(&md).unwrap();
+        let split = md2mdblocks(md).await.unwrap();
+        assert_eq!(split.blocks.len(), 6);
+        assert_eq!(split.metadata.len(), 4);
+        assert_eq!(split.metadata.get("title"), Some(&serde_yaml::Value::String("my title".to_string())));
+    }
+
+    #[tokio::test]
+    async fn md2htmlblocks_basic() {
+        let (md, cwd) = read_file("basic.md");
+        let fpath = cwd.join("basic.md");
+        let (json, _) = md2htmlblocks(md, fpath.as_path(), fpath.parent().unwrap()).await.unwrap();
+        let json: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            json.get("htmlblocks").unwrap().as_array().unwrap()[1].as_array().unwrap()[1].as_str().unwrap().trim_end(),
+            "<p>test</p>"
+        );
+    }
+
+    #[tokio::test]
+    async fn md2htmlblocks_multiple_meta() {
+        let (md, cwd) = read_file("multiple-metablocks.md");
+        let fpath = cwd.join("multiple-metablocks.md");
+        let (json, _) = md2htmlblocks(md, fpath.as_path(), fpath.parent().unwrap()).await.unwrap();
+
+        let json: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(json.get("toc").unwrap(), &serde_json::Value::Bool(true));
+        assert_eq!(json.get("reference-section-title").unwrap(), &serde_json::Value::String("My reference title".to_string()));
+    }
+
+    #[tokio::test]
+    async fn md2htmlblocks_twobibs_toc_relative_link() {
+        let (md, cwd) = read_file("two-bibs-toc-relative-link.md");
+        let fpath = cwd.join("citations.md");
+        let (json, citeproc_handle) = md2htmlblocks(md, fpath.as_path(), fpath.parent().unwrap()).await.unwrap();
+
+        let json: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let (expected, _) = read_file("two-bibs-toc-relative-link-linkblock.html");
+        // TODO: 3->4 after implementing title block
+        assert_eq!(
+            json.get("htmlblocks").unwrap().as_array().unwrap()[3].as_array().unwrap()[1].as_str().unwrap().trim_end(),
+            std::str::from_utf8(&expected).unwrap().replace("{cwd}", cwd.to_str().unwrap()).trim_end()
+        );
+
+        let citeproc_out = citeproc_handle.await.unwrap();
+        let citeproc_msg: serde_json::Value = serde_json::from_str(&citeproc_out).unwrap();
+        let (expected, _) = read_file("two-bibs-toc-relative-link-citeproc.html");
+        assert_eq!(citeproc_msg["html"], std::str::from_utf8(&expected).unwrap());
+    }
+
+    #[tokio::test]
+    async fn md2htmlblocks_bib() {
+        let (md, cwd) = read_file("citations.md");
+        let fpath = cwd.join("citations.md");
+        let (_, citeproc_handle) = md2htmlblocks(md, fpath.as_path(), fpath.parent().unwrap()).await.unwrap();
+        let citeproc_out = citeproc_handle.await.unwrap();
+        let citeproc_msg: serde_json::Value = serde_json::from_str(&citeproc_out).unwrap();
+
+        let (expected, _) = read_file("citations-citeproc.html");
+
+        assert_eq!(citeproc_msg["html"], std::str::from_utf8(&expected).unwrap());
+    }
+
+    // TODO: test for title
+}

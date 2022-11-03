@@ -1,5 +1,10 @@
 mod server;
+#[cfg(not(feature = "cmark"))]
 mod md;
+#[cfg(feature = "cmark")]
+mod md_cmark;
+
+use anyhow::Result;
 
 use std::path::PathBuf;
 
@@ -17,7 +22,7 @@ pub struct Args {
     home: PathBuf,
 }
 
-pub async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+pub async fn main() -> Result<()> {
     let args = Args::parse();
     server::run(args).await?;
     Ok(())

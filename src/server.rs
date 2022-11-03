@@ -1,6 +1,9 @@
 mod auth;
 
+#[cfg(not(feature = "cmark"))]
 use crate::md::md2htmlblocks;
+#[cfg(feature = "cmark")]
+use crate::md_cmark::md2htmlblocks;
 
 use std::net::{SocketAddr, Ipv4Addr};
 use std::collections::HashMap;
