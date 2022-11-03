@@ -1,8 +1,9 @@
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result};
 
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
-use std::fmt::Write;
+use std::fmt::Write as _;
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
 use cached::proc_macro::cached;
@@ -270,50 +271,22 @@ async fn md2mdblocks(md: &str) -> Result<SplitMarkdown> {
     })
 }
 
-fn get_citeblocks(block: &serde_json::Value, list: &mut Vec<serde_json::Value>) -> () {
-    match block {
-        serde_json::Value::Object(map) => {
-            if let Some(ty) = map.get("t") {
-                if ty == "Cite" {
-                    list.push(serde_json::json!({"t": "Para", "c": [block.clone()]}));
-                    return;
-                }
-            }
-
-            for block in map.values() {
-                get_citeblocks(block, list);
-            }
-
-        },
-        serde_json::Value::Array(vec) => {
-            for block in vec {
-                get_citeblocks(block, list);
-            }
-        },
-        _ => {}
-    };
-}
-
 #[derive(Serialize_tuple, Clone)]
 struct Htmlblock {
     hash: u64,
     html: String,
     #[serde(skip_serializing)]
-    citeblocks: Vec<serde_json::Value>,
+    citeblocks: String,
 }
 
 #[cached(result=true, size=8192, key="u64", convert="{hash}")]
 async fn mdblock2htmlblock(md_block: &str, hash: u64, cwd: &Path) -> Result<Htmlblock> {
 
-    // First convert html to json
-    // This intermediate json step is only used to we can easily extract citeblocks from json
-    // TODO: can we somehow omit this? directly parse citeblocks? or extract citeblocks from
-    //       resulting html?
     let mut cmd = Command::new("pandoc");
     cmd
         .current_dir(cwd)
         .arg("--from").arg("markdown+emoji")
-        .arg("--to").arg("json")
+        .arg("--to").arg("html5")
         .arg("--katex");
 
     cmd.stdout(std::process::Stdio::piped());
@@ -327,30 +300,20 @@ async fn mdblock2htmlblock(md_block: &str, hash: u64, cwd: &Path) -> Result<Html
     // Send EOF to child
     drop(stdin);
 
-    let raw_json = child.wait_with_output().await?.stdout;
-
-    // Then convert json to html
-    let mut cmd = Command::new("pandoc");
-    cmd
-        .current_dir(cwd)
-        .arg("--from").arg("json")
-        .arg("--to").arg("html5")
-        .arg("--katex");
-
-    cmd.stdout(std::process::Stdio::piped());
-    cmd.stdin(std::process::Stdio::piped());
-
-    let mut child = cmd.spawn()?;
-    let mut stdin = child.stdin.take().expect("stdin take failed");
-
-    stdin.write_all(&raw_json).await?;
-
-    // Send EOF to child
-    drop(stdin);
-
     let out = child.wait_with_output().await?;
     let mut out = String::from_utf8(out.stdout)?;
 
+    let fragment = scraper::Html::parse_fragment(&out);
+    lazy_static! {
+        static ref CITE_SELECTOR: scraper::Selector = scraper::Selector::parse("span.citation").unwrap();
+    }
+
+    let citeblocks: String = fragment.select(&CITE_SELECTOR)
+        .map(|element| element.text().next().unwrap_or(""))
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    // TODO: replace URL_REGEX thing? Now that we anyway parse the html?
     // Replace relative local URLs
     // Alternative is fancy_regex which supports negative backtracking.
     // But this here is faster for the common case where there are only few local links.
@@ -379,12 +342,6 @@ async fn mdblock2htmlblock(md_block: &str, hash: u64, cwd: &Path) -> Result<Html
         out = new;
     }
 
-    // find citeproc elements
-    let parsed_block: serde_json::Value = serde_json::from_slice(&raw_json)?;
-
-    let mut citeblocks: Vec<serde_json::Value> = Vec::new();
-    get_citeblocks(&parsed_block, &mut citeblocks);
-
     Ok(Htmlblock {
         html: out,
         citeblocks: citeblocks,
@@ -394,14 +351,10 @@ async fn mdblock2htmlblock(md_block: &str, hash: u64, cwd: &Path) -> Result<Html
 
 const BIBKEYS: &'static [&'static str] = &["bibliography", "csl", "link-citations", "nocite", "references"];
 
-fn mtime_from_meta_bibliography(bibliography: &serde_json::Map<String, serde_json::Value>, cwd: &Path) -> Result<u64> {
-    if let serde_json::Value::String(bibfile) = &bibliography["c"][0]["c"] {
-        let bibfile = cwd.join(PathBuf::from(bibfile));
-        let mtime = std::fs::metadata(bibfile)?.modified()?.duration_since(std::time::SystemTime::UNIX_EPOCH)?.as_secs();
-        return Ok(mtime);
-    } else {
-        Err(anyhow!("Unexpected json structure in bibliography"))
-    }
+fn mtime_from_file(file: &str, cwd: &Path) -> Result<u64> {
+    let file = cwd.join(PathBuf::from(file));
+    let mtime = std::fs::metadata(file)?.modified()?.duration_since(std::time::SystemTime::UNIX_EPOCH)?.as_secs();
+    return Ok(mtime);
 }
 
 type RawPandocBlock = serde_json::value::RawValue;
@@ -434,67 +387,40 @@ async fn uniqueciteprocdict(split_md: &SplitMarkdown, htmlblocks: &Vec<Htmlblock
         return Ok(None);
     }
 
-    // collect all cite blocks
-    let citeblocks = htmlblocks.iter().map(|b| &b.citeblocks).flatten().collect::<Vec<&serde_json::Value>>();
+    // TODO: add capacity?
+    let mut buf = Vec::new();
 
-    // yaml metadata to pandoc json format
-    // TODO: do better? could do this for one of the blocks? or at least cache the result?
-    //       or get rid of it entirely if we parse citeblocks from html?
+    // write metadata block
+    write!(&mut buf, "---\n")?;
 
-    let mut cmd = Command::new("pandoc");
-    cmd
-        .current_dir(cwd)
-        .arg("--from").arg("markdown+emoji")
-        .arg("--to").arg("json")
-        .arg("--katex");
-
-    cmd.stdout(std::process::Stdio::piped());
-    cmd.stdin(std::process::Stdio::piped());
-
-    let mut child = cmd.spawn()?;
-    let mut stdin = child.stdin.take().expect("stdin take failed");
-
-    stdin.write_all(b"---\n").await?;
-    stdin.write_all(&serde_yaml::to_string(&cloned_yaml_metadata)?.as_bytes()).await?;
-    stdin.write_all(b"\n---\n").await?;
-
-    // Send EOF to child
-    drop(stdin);
-
-    let json = child.wait_with_output().await?.stdout;
-    let doc: PandocDoc = serde_json::from_slice(&json)?;
-
-    let mut doc = PandocDocNonRawBlocks {
-        pandoc_api_version: doc.pandoc_api_version,
-        blocks: citeblocks,
-        meta: doc.meta,
-    };
-
-    // .bib mtimes
-    if let Some(serde_json::Value::Object(bibliography)) = doc.meta.get_mut("bibliography") {
-
-        if bibliography["t"] == "MetaInlines" {
-            let mtime = mtime_from_meta_bibliography(bibliography, cwd)?;
-            bibliography.insert("bibliography_mtimes_".to_string(), serde_json::json!(mtime));
-        } else if let serde_json::Value::Array(bibs) = &bibliography["c"] {
-            let mtimes = bibs.iter().map(|bibliography| {
-                    let bibliography = if let serde_json::Value::Object(x) = bibliography { x } else { return Err(anyhow!("bibliography not an Object")) };
-                    let mtime = mtime_from_meta_bibliography(bibliography, cwd)?;
-                    Ok::<serde_json::Value, anyhow::Error>(serde_json::json!(mtime))
-                })
-                .collect::<Result<Vec<serde_json::Value>>>()?;
-            bibliography.insert("bibliography_mtimes_".to_string(), serde_json::Value::Array(mtimes));
-        }
+    // add mtimes of bib files etc.
+    match cloned_yaml_metadata.get("bibliography") {
+        Some(serde_yaml::Value::String(bibfile)) => {
+            write!(&mut buf, "bibliography_mtime_: {}\n", mtime_from_file(&bibfile, cwd)?)?;
+        },
+        Some(serde_yaml::Value::Sequence(bibs)) => {
+            for (i, bibfile) in bibs.iter().enumerate() {
+                if let serde_yaml::Value::String(bibfile) = bibfile {
+                    write!(&mut buf, "bibliography_mtime_{}_: {}\n", i, mtime_from_file(&bibfile, cwd)?)?;
+                }
+            }
+        },
+        _ => {},
+    }
+    if let Some(serde_yaml::Value::String(cslfile)) = cloned_yaml_metadata.get("csl") {
+        let mtime = mtime_from_file(&cslfile, cwd)?;
+        write!(&mut buf, "csl_mtime_: {}\n", mtime)?;
     }
 
-    if let Some(serde_json::Value::Object(csl)) = doc.meta.get_mut("csl") {
-        let mtime = mtime_from_meta_bibliography(&csl, cwd)?;
-            csl.insert("csl_mtime_".to_string(), serde_json::json!(mtime));
+    // write actual metadata
+    write!(&mut buf, "{}---\n\n", &serde_yaml::to_string(&cloned_yaml_metadata)?)?;
+
+    // write cite blocks
+    for block in htmlblocks {
+        write!(&mut buf, "{}", block.citeblocks)?;
     }
 
-
-    let json = serde_json::to_vec(&doc)?;
-    Ok(Some(json))
+    Ok(Some(buf))
 }
 
 #[derive(Serialize)]
@@ -509,7 +435,7 @@ async fn citeproc(bibid: Option<u64>, citeproc_input: Option<Vec<u8>>, cwd: &Pat
     let out = if let Some(citeproc_input) = citeproc_input {
         let mut cmd = Command::new("pandoc");
         cmd.current_dir(cwd)
-            .arg("--from").arg("json")
+            .arg("--from").arg("markdown+emoji")
             .arg("--to").arg("html5")
             .arg("--katex")
             .arg("--citeproc");
@@ -741,7 +667,7 @@ mod tests {
 
         let citeproc_out = citeproc_handle.await.unwrap();
         let citeproc_msg: serde_json::Value = serde_json::from_str(&citeproc_out).unwrap();
-        let (expected, _) = read_file("two-bibs-toc-relative-link-citeproc.html");
+        let (expected, _) = read_file("two-bibs-toc-relative-link-citeproc-cmark.html");
         assert_eq!(citeproc_msg["html"], std::str::from_utf8(&expected).unwrap());
     }
 
@@ -753,7 +679,7 @@ mod tests {
         let citeproc_out = citeproc_handle.await.unwrap();
         let citeproc_msg: serde_json::Value = serde_json::from_str(&citeproc_out).unwrap();
 
-        let (expected, _) = read_file("citations-citeproc.html");
+        let (expected, _) = read_file("citations-citeproc-cmark.html");
 
         assert_eq!(citeproc_msg["html"], std::str::from_utf8(&expected).unwrap());
     }

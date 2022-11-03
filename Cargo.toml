@@ -6,7 +6,7 @@ edition = "2021"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [features]
-cmark = ["dep:serde_yaml", "dep:pulldown-cmark"]
+cmark = ["dep:serde_yaml", "dep:pulldown-cmark", "dep:scraper"]
 
 [dependencies]
 serde = { version = "1.0", features = ["derive"] }
@@ -30,6 +30,7 @@ anyhow = "1.0"
 libsystemd = "0.5"
 pulldown-cmark = { version = "0.9",  default-features = false, features = ["simd"], optional = true }
 serde_yaml = { version = "0.9", optional = true }
+scraper = { version = "0.13", optional = true }
 
 [dev-dependencies]
 lzma-rs = "0.2"
