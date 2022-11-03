@@ -6,6 +6,8 @@ use std::fmt::Write as _;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
+use tracing::debug;
+
 use cached::proc_macro::cached;
 
 use serde::{Deserialize, Serialize};
@@ -558,7 +560,7 @@ pub async fn md2htmlblocks<'a>(md: Bytes, fpath: &Path, cwd: &'a Path) -> Result
         reference_section_title: split_md.get_meta_str("reference-section-title").unwrap_or(""),
     };
 
-    println!("md2htmlblocks (cmark) total = {:?}", _start.elapsed());
+    debug!("md2htmlblocks (cmark) total = {:?}", _start.elapsed());
 
     let jsonmessage = serde_json::to_string(&message)?;
     Ok((jsonmessage, citeproc(bibid, citejson, cwd)))

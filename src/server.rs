@@ -5,6 +5,8 @@ use crate::md::md2htmlblocks;
 #[cfg(feature = "cmark")]
 use crate::md_cmark::md2htmlblocks;
 
+use tracing::{trace, warn};
+
 use std::net::{SocketAddr, Ipv4Addr};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -31,7 +33,7 @@ type PeerMap = Arc<Mutex<HashMap<SocketAddr, Tx>>>;
 
 async fn new_websocket_content(msg: String, home: &Path, peer_map: &PeerMap, queue: &Queue) -> Result<()> {
     if !msg.starts_with("filepath:") {
-        println!("Received unknown TEXT message: {}", msg);
+        trace!("Received unknown TEXT message: {}", msg);
         return Ok(());
     }
 
@@ -43,15 +45,15 @@ async fn new_websocket_content(msg: String, home: &Path, peer_map: &PeerMap, que
                 md: content.into(),
             };
 
-            println!("Got data from file {}", &msg[9..]);
+            trace!("Got data from file {}", &msg[9..]);
             submit_new_content(&peer_map, &queue, new_content);
         },
         Err(e) => {
-            println!("Could not load data from file {}", &msg[9..]);
+            trace!("Could not load data from file {}", &msg[9..]);
             let msg = serde_json::to_string(&ErrMsg { error: format!("{}", e)})?;
             let msg = Message::text(msg);
 
-            println!("sending Err from filepath request to clients!");
+            trace!("sending Err from filepath request to clients!");
             send_message_to_all_clients(&peer_map, msg).await?;
         }
     };
@@ -59,11 +61,11 @@ async fn new_websocket_content(msg: String, home: &Path, peer_map: &PeerMap, que
 }
 
 async fn handle_connection(stream: TcpStream, addr: SocketAddr, secret: String, peer_map: PeerMap, queue: Queue, home: PathBuf) -> Result<()>  {
-    println!("incoming connection");
+    trace!("incoming connection");
     let mut ws_stream = tokio_tungstenite::accept_async(stream)
         .await
         .expect("Error during the websocket handshake occurred");
-    println!("ws connected");
+    trace!("ws connected");
 
     // First authenticate client, then work with it
     {
@@ -95,7 +97,7 @@ async fn handle_connection(stream: TcpStream, addr: SocketAddr, secret: String, 
                 // really wanted to abort receiving connections from this client. Or use
                 // something other than `try_for_each`. But since the errors that can actually
                 // occur here are not necessarily fatal, just print them.
-                eprintln!("Error handling new websocket content: {}", e);
+                warn!("Error handling new websocket content: {}", e);
             }
         }
 
@@ -108,7 +110,7 @@ async fn handle_connection(stream: TcpStream, addr: SocketAddr, secret: String, 
     pin_mut!(wait_forward, wait_incoming);
     future::select(wait_forward, wait_incoming).await;
 
-    println!("{} disconnected", &addr);
+    trace!("{} disconnected", &addr);
     peer_map.lock().unwrap().remove(&addr);
 
     Ok(())
@@ -127,7 +129,7 @@ async fn progressbar(peer_map: PeerMap) -> Result<()> {
         i += 1;
         let msg = Message::text(serde_json::to_string(&StatusMsg{status: &" 🞄 ".repeat(i)})?);
 
-        println!("sending PROGRESS to clients!");
+        trace!("sending PROGRESS to clients!");
         send_message_to_all_clients(&peer_map, msg).await?;
     }
 }
@@ -180,7 +182,7 @@ async fn process_new_content(peer_map: PeerMap, queue: Queue, mut new: NewConten
             };
             let msg = Message::text(msg);
 
-            println!("sending to clients!");
+            trace!("sending to clients!");
             send_message_to_all_clients(&peer_map, msg).await?;
 
             // citeproc
@@ -190,7 +192,7 @@ async fn process_new_content(peer_map: PeerMap, queue: Queue, mut new: NewConten
                 let citeproc_json = citeproc_handle.await?;
                 let msg = Message::text(citeproc_json);
 
-                println!("sending CITEPROC to clients!");
+                trace!("sending CITEPROC to clients!");
                 send_message_to_all_clients(&peer_map, msg).await?;
             }
         }
@@ -227,7 +229,7 @@ fn submit_new_content(peer_map: &PeerMap, queue: &Queue, new: NewContent) {
     {
         let mut status = queue.lock().unwrap();
         if status.processing {
-            println!("Still BUSY - putting it in queue.");
+            trace!("Still BUSY - putting it in queue.");
             status.new_content = Some(new);
             return;
         } else {
@@ -280,7 +282,7 @@ impl tokio_util::codec::Decoder for NewPipeContentCodec<'_> {
     fn decode(&mut self, buf: &mut BytesMut) -> Result<Option<Self::Item>> {
         if !buf.is_empty() {
             if buf.last().unwrap() == &0 {
-                println!("got data, len = {}, emitting new content", buf.len()-1);
+                trace!("got data, len = {}, emitting new content", buf.len()-1);
                 // First take out complete buffer
                 let mut buf = buf.split();
                 let len = buf.len();
@@ -288,7 +290,7 @@ impl tokio_util::codec::Decoder for NewPipeContentCodec<'_> {
                 let new_content = self.parse_pipe_content(buf.split_to(len-1))?;
                 Ok(Some(new_content))
             } else {
-                println!("got data, len = {}, but waiting for \\0", buf.len());
+                trace!("got data, len = {}, but waiting for \\0", buf.len());
                 Ok(None)
             }
         } else {
@@ -301,7 +303,7 @@ impl tokio_util::codec::Decoder for NewPipeContentCodec<'_> {
             Ok(None)
         } else {
             let len = buf.len();
-            println!("got eof - giving out len = {}", len);
+            trace!("got eof - giving out len = {}", len);
             let new_content = self.parse_pipe_content(buf.split_to(len))?;
             Ok(Some(new_content))
         }
@@ -314,7 +316,7 @@ async fn monitorpipe(file: Option<tokio::fs::File>, pipe: PathBuf, peer_map: Pee
     let mut file = if let Some(file) = file {
         file
     } else {
-        println!("Opening pipe from path");
+        trace!("Opening pipe from path");
         match tokio::fs::File::open(&pipe).await {
             Ok(file) => file,
             Err(e) => return Err(anyhow!(e)),
@@ -326,7 +328,7 @@ async fn monitorpipe(file: Option<tokio::fs::File>, pipe: PathBuf, peer_map: Pee
             file, NewPipeContentCodec::new(&home), 65_536);
         while let Some(read) = pipe_stream.next().await {
             let new_content = read?;
-            println!("got new content!");
+            trace!("got new content!");
             submit_new_content(&peer_map, &queue, new_content);
         }
 
@@ -429,7 +431,7 @@ pub async fn run(args: crate::Args) -> Result<()> {
 
     // Start receiving content from pipe
     let file = if let Some(fd) = fd_pipe {
-        println!("opening pipe from fd_pipe: {}", fd);
+        trace!("opening pipe from fd_pipe: {}", fd);
         // SAFETY: The pipe fd is used only here at startup which happens exactly once.
         // If one ever were to change this function `run` to be called twice, then
         // `read_socket_activation_fds()` would not return anything since we set `unset_env`
@@ -442,7 +444,7 @@ pub async fn run(args: crate::Args) -> Result<()> {
     
     // Listener for websocket
     let listener = if let Some(fd) = fd_websocket {
-        println!("fd_websocket from systemd: {}!", fd);
+        trace!("fd_websocket from systemd: {}!", fd);
         // SAFETY: The websocket fd is used only here at startup which happens exactly once.
         // If one ever were to change this function `run` to be called twice, then
         // `read_socket_activation_fds()` would not return anything since we set `unset_env`

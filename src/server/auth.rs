@@ -1,5 +1,7 @@
 use anyhow::{Context, Result};
 
+use tracing::trace;
+
 use tokio::net::TcpStream;
 use tokio_tungstenite::{WebSocketStream, tungstenite::protocol::Message};
 
@@ -95,7 +97,7 @@ pub async fn try_auth_client(ws_stream: &mut WebSocketStream<TcpStream>, secret:
         let json = serde_json::to_string(&AuthMsgResponseServer {snonce: &snonce, hash: &hash})?;
         ws_stream.send(Message::text(json)).await?;
 
-        println!("AUTH SUCCESS");
+        trace!("AUTH SUCCESS");
         Ok(())
     } else {
         let json = serde_json::to_string(&AuthFailResponseServer {auth: false})?;

@@ -3,6 +3,8 @@ use anyhow::{Context, Result, anyhow};
 use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 
+use tracing::debug;
+
 use cached::proc_macro::cached;
 
 use std::collections::hash_map::DefaultHasher;
@@ -199,8 +201,6 @@ async fn json2htmlblock(pandoc_api_version: &RawPandocApiVersion, block: &RawPan
 
 #[cached(result=true, size=8192, key="u64", convert="{hash}")]
 async fn json2titleblock(json: &Vec<u8>, hash: u64, cwd: &Path) -> Result<Option<Htmlblock>> {
-    println!("doing json2titleblock!");
-
     let mut cmd = Command::new("pandoc");
     cmd
         .current_dir(cwd)
@@ -436,7 +436,7 @@ pub async fn md2htmlblocks<'a>(md: Bytes, fpath: &Path, cwd: &'a Path) -> Result
         reference_section_title: doc.get_meta_str("reference-section-title").unwrap_or(""),
     };
 
-    println!("md2htmlblocks total = {:?}", _start.elapsed());
+    debug!("md2htmlblocks total = {:?}", _start.elapsed());
 
     let jsonmessage = serde_json::to_string(&message)?;
     Ok((jsonmessage, citeproc(bibid, citejson, cwd)))

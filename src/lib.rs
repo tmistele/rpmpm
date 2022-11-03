@@ -10,6 +10,9 @@ use std::path::PathBuf;
 
 use clap::Parser;
 
+// TODO: mathml vs katex
+// TODO: revealjs
+
 /// pmpm: pandoc markdown preview machine, a simple markdown previewer
 #[derive(Parser, Debug)]
 pub struct Args {
@@ -23,6 +26,7 @@ pub struct Args {
 }
 
 pub async fn main() -> Result<()> {
+    tracing_subscriber::fmt::init();
     let args = Args::parse();
     server::run(args).await?;
     Ok(())

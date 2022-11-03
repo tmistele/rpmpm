@@ -31,6 +31,8 @@ libsystemd = "0.5"
 pulldown-cmark = { version = "0.9",  default-features = false, features = ["simd"], optional = true }
 serde_yaml = { version = "0.9", optional = true }
 scraper = { version = "0.13", optional = true }
+tracing = "0.1"
+tracing-subscriber = "0.3"
 
 [dev-dependencies]
 lzma-rs = "0.2"
