@@ -313,7 +313,7 @@ async fn mdblock2htmlblock(md_block: &str, hash: u64, cwd: &Path) -> Result<Html
     let citeblocks: String = fragment.select(&CITE_SELECTOR)
         .map(|element| element.text().next().unwrap_or(""))
         .collect::<Vec<_>>()
-        .join("\n");
+        .join("\n\n");
 
     // TODO: replace URL_REGEX thing? Now that we anyway parse the html?
     // Replace relative local URLs
@@ -419,7 +419,7 @@ async fn uniqueciteprocdict(split_md: &SplitMarkdown, htmlblocks: &Vec<Htmlblock
 
     // write cite blocks
     for block in htmlblocks {
-        write!(&mut buf, "{}", block.citeblocks)?;
+        write!(&mut buf, "{}\n\n", block.citeblocks)?;
     }
 
     Ok(Some(buf))
@@ -669,7 +669,7 @@ mod tests {
 
         let citeproc_out = citeproc_handle.await.unwrap();
         let citeproc_msg: serde_json::Value = serde_json::from_str(&citeproc_out).unwrap();
-        let (expected, _) = read_file("two-bibs-toc-relative-link-citeproc-cmark.html");
+        let (expected, _) = read_file("two-bibs-toc-relative-link-citeproc.html");
         assert_eq!(citeproc_msg["html"], std::str::from_utf8(&expected).unwrap());
     }
 
@@ -681,7 +681,7 @@ mod tests {
         let citeproc_out = citeproc_handle.await.unwrap();
         let citeproc_msg: serde_json::Value = serde_json::from_str(&citeproc_out).unwrap();
 
-        let (expected, _) = read_file("citations-citeproc-cmark.html");
+        let (expected, _) = read_file("citations-citeproc.html");
 
         assert_eq!(citeproc_msg["html"], std::str::from_utf8(&expected).unwrap());
     }
