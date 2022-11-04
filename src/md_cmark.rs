@@ -10,7 +10,7 @@ use tracing::debug;
 
 use cached::proc_macro::cached;
 
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use serde_tuple::Serialize_tuple;
 
 use tokio::io::AsyncWriteExt;
@@ -357,26 +357,6 @@ fn mtime_from_file(file: &str, cwd: &Path) -> Result<u64> {
     let file = cwd.join(PathBuf::from(file));
     let mtime = std::fs::metadata(file)?.modified()?.duration_since(std::time::SystemTime::UNIX_EPOCH)?.as_secs();
     return Ok(mtime);
-}
-
-type RawPandocBlock = serde_json::value::RawValue;
-type RawPandocApiVersion = serde_json::value::RawValue;
-
-#[derive(Serialize, Debug)]
-struct PandocDocNonRawBlocks<'a> {
-    #[serde(rename = "pandoc-api-version")]
-    pandoc_api_version: &'a RawPandocApiVersion,
-    meta: serde_json::Map<String, serde_json::Value>,
-    blocks: Vec<&'a serde_json::Value>,
-}
-
-#[derive(Serialize, Deserialize, Debug)]
-struct PandocDoc<'a> {
-    #[serde(rename = "pandoc-api-version")]
-    pandoc_api_version: &'a RawPandocApiVersion,
-    meta: serde_json::Map<String, serde_json::Value>,
-    #[serde(borrow)]
-    blocks: Vec<&'a RawPandocBlock>,
 }
 
 async fn uniqueciteprocdict(split_md: &SplitMarkdown, htmlblocks: &Vec<Htmlblock>, cwd: &Path) -> Result<Option<Vec<u8>>> {
