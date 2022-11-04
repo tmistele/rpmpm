@@ -447,101 +447,106 @@ mod tests {
     
     use crate::md::*;
 
-    fn read_file(filename: &str) -> (Bytes, PathBuf) {
+    fn read_file(filename: &str) -> Result<(Bytes, PathBuf)> {
         let filepath = PathBuf::from(format!(
             "{}/resources/tests/{}",
-            std::env::var("CARGO_MANIFEST_DIR").unwrap(), filename));
+            std::env::var("CARGO_MANIFEST_DIR")?, filename));
 
         if filename.ends_with(".xz") {
-            let mut f = std::io::BufReader::new(std::fs::File::open(&filepath).unwrap());
+            let mut f = std::io::BufReader::new(std::fs::File::open(&filepath)?);
             let mut decomp: Vec<u8> = Vec::new();
-            lzma_rs::xz_decompress(&mut f, &mut decomp).unwrap();
+            lzma_rs::xz_decompress(&mut f, &mut decomp)?;
 
-            (decomp.into(), filepath.parent().unwrap().to_path_buf())
+            Ok((decomp.into(), filepath.parent().context("no parent")?.to_path_buf()))
         } else {
-            (fs::read(&filepath).unwrap().into(), filepath.parent().unwrap().to_path_buf())
+            Ok((fs::read(&filepath)?.into(), filepath.parent().context("no parent")?.to_path_buf()))
         }
 
     }
 
-    fn roundtripped_json(filename: &str) -> String {
-        let (json, _) = read_file(filename);
-        let json = std::str::from_utf8(&json).unwrap();
-        let json: serde_json::Value = serde_json::from_str(json).unwrap();
-        serde_json::to_string(&json).unwrap()
+    fn roundtripped_json(filename: &str) -> Result<String> {
+        let (json, _) = read_file(filename)?;
+        let json = std::str::from_utf8(&json)?;
+        let json: serde_json::Value = serde_json::from_str(json)?;
+        Ok(serde_json::to_string(&json)?)
     }
 
-    fn doc_to_json_roundtrip(doc: &PandocDoc) -> String {
-        let json = serde_json::to_string(&doc).unwrap();
-        let json: serde_json::Value = serde_json::from_str(&json).unwrap();
-        serde_json::to_string(&json).unwrap()
+    fn doc_to_json_roundtrip(doc: &PandocDoc) -> Result<String> {
+        let json = serde_json::to_string(&doc)?;
+        let json: serde_json::Value = serde_json::from_str(&json)?;
+        Ok(serde_json::to_string(&json)?)
     }
     
     #[tokio::test]
-    async fn md2json_basic() {
-        let (md, cwd) = read_file("basic.md");
-        let json = roundtripped_json("basic.json");
+    async fn md2json_basic() -> Result<()> {
+        let (md, cwd) = read_file("basic.md")?;
+        let json = roundtripped_json("basic.json")?;
 
-        let doc = md2json(&md, cwd.as_path()).await.unwrap();
-        let doc: PandocDoc = serde_json::from_str(&doc).unwrap();
+        let doc = md2json(&md, cwd.as_path()).await?;
+        let doc: PandocDoc = serde_json::from_str(&doc)?;
 
-        assert_eq!(doc_to_json_roundtrip(&doc), json);
+        assert_eq!(doc_to_json_roundtrip(&doc)?, json);
+        Ok(())
     }
 
     #[tokio::test]
-    async fn md2json_long() {
+    async fn md2json_long() -> Result<()> {
         // Longer than 64kb which may be larger than pipe
         // That's why we need `write_all` and not just `write`
-        let (md, cwd) = read_file("long.md.xz");
-        let json = roundtripped_json("long.json.xz");
+        let (md, cwd) = read_file("long.md.xz")?;
+        let json = roundtripped_json("long.json.xz")?;
 
-        let doc = md2json(&md, cwd.as_path()).await.unwrap();
-        let doc: PandocDoc = serde_json::from_str(&doc).unwrap();
+        let doc = md2json(&md, cwd.as_path()).await?;
+        let doc: PandocDoc = serde_json::from_str(&doc)?;
 
-        assert_eq!(doc_to_json_roundtrip(&doc), json);
+        assert_eq!(doc_to_json_roundtrip(&doc)?, json);
+        Ok(())
     }
 
     #[tokio::test]
-    async fn md2htmlblocks_bib() {
-        let (md, cwd) = read_file("citations.md");
+    async fn md2htmlblocks_bib() -> Result<()> {
+        let (md, cwd) = read_file("citations.md")?;
         let fpath = cwd.join("citations.md");
-        let (_, citeproc_handle) = md2htmlblocks(md, fpath.as_path(), fpath.parent().unwrap()).await.unwrap();
-        let citeproc_out = citeproc_handle.await.unwrap();
-        let citeproc_msg: serde_json::Value = serde_json::from_str(&citeproc_out).unwrap();
+        let (_, citeproc_handle) = md2htmlblocks(md, fpath.as_path(), fpath.parent().context("no parent")?).await?;
+        let citeproc_out = citeproc_handle.await?;
+        let citeproc_msg: serde_json::Value = serde_json::from_str(&citeproc_out)?;
 
-        let (expected, _) = read_file("citations-citeproc.html");
+        let (expected, _) = read_file("citations-citeproc.html")?;
 
-        assert_eq!(citeproc_msg["html"], std::str::from_utf8(&expected).unwrap());
+        assert_eq!(citeproc_msg["html"], std::str::from_utf8(&expected)?);
+        Ok(())
     }
 
     #[tokio::test]
-    async fn md2htmlblocks_twobibs_toc_relative_link() {
-        let (md, cwd) = read_file("two-bibs-toc-relative-link.md");
+    async fn md2htmlblocks_twobibs_toc_relative_link() -> Result<()> {
+        let (md, cwd) = read_file("two-bibs-toc-relative-link.md")?;
         let fpath = cwd.join("citations.md");
-        let (json, citeproc_handle) = md2htmlblocks(md, fpath.as_path(), fpath.parent().unwrap()).await.unwrap();
+        let (json, citeproc_handle) = md2htmlblocks(md, fpath.as_path(), fpath.parent().context("no parent")?).await?;
 
-        let json: serde_json::Value = serde_json::from_str(&json).unwrap();
-        let (expected, _) = read_file("two-bibs-toc-relative-link-linkblock.html");
+        let json: serde_json::Value = serde_json::from_str(&json)?;
+        let (expected, _) = read_file("two-bibs-toc-relative-link-linkblock.html")?;
         assert_eq!(
-            json.get("htmlblocks").unwrap().as_array().unwrap()[4].as_array().unwrap()[1].as_str().unwrap().trim_end(),
-            std::str::from_utf8(&expected).unwrap().replace("{cwd}", cwd.to_str().unwrap()).trim_end()
+            json.get("htmlblocks").context("no htmlblocks")?.as_array().context("no array")?[4].as_array().context("no array")?[1].as_str().context("no string")?.trim_end(),
+            std::str::from_utf8(&expected)?.replace("{cwd}", cwd.to_str().context("non-utf8 cwd")?).trim_end()
         );
 
-        let citeproc_out = citeproc_handle.await.unwrap();
-        let citeproc_msg: serde_json::Value = serde_json::from_str(&citeproc_out).unwrap();
-        let (expected, _) = read_file("two-bibs-toc-relative-link-citeproc.html");
-        assert_eq!(citeproc_msg["html"], std::str::from_utf8(&expected).unwrap());
+        let citeproc_out = citeproc_handle.await?;
+        let citeproc_msg: serde_json::Value = serde_json::from_str(&citeproc_out)?;
+        let (expected, _) = read_file("two-bibs-toc-relative-link-citeproc.html")?;
+        assert_eq!(citeproc_msg["html"], std::str::from_utf8(&expected)?);
+        Ok(())
     }
 
     #[tokio::test]
-    async fn md2htmlblocks_title() {
-        let (md, cwd) = read_file("title.md");
+    async fn md2htmlblocks_title() -> Result<()> {
+        let (md, cwd) = read_file("title.md")?;
         let fpath = cwd.join("title.md");
-        let (new_content, _) = md2htmlblocks(md, fpath.as_path(), fpath.parent().unwrap()).await.unwrap();
-        let new_content: serde_json::Value = serde_json::from_str(&new_content).unwrap();
+        let (new_content, _) = md2htmlblocks(md, fpath.as_path(), fpath.parent().context("no parent")?).await?;
+        let new_content: serde_json::Value = serde_json::from_str(&new_content)?;
 
-        let (expected, _) = read_file("title-title.html");
+        let (expected, _) = read_file("title-title.html")?;
 
-        assert_eq!(new_content["htmlblocks"][0][1], std::str::from_utf8(&expected).unwrap());
+        assert_eq!(new_content["htmlblocks"][0][1], std::str::from_utf8(&expected)?);
+        Ok(())
     }
 }

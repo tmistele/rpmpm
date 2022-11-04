@@ -552,42 +552,44 @@ mod tests {
     
     use crate::md_cmark::*;
 
-    fn read_file(filename: &str) -> (Bytes, PathBuf) {
+    fn read_file(filename: &str) -> Result<(Bytes, PathBuf)> {
         let filepath = PathBuf::from(format!(
             "{}/resources/tests/{}",
-            std::env::var("CARGO_MANIFEST_DIR").unwrap(), filename));
+            std::env::var("CARGO_MANIFEST_DIR")?, filename));
 
         if filename.ends_with(".xz") {
-            let mut f = std::io::BufReader::new(std::fs::File::open(&filepath).unwrap());
+            let mut f = std::io::BufReader::new(std::fs::File::open(&filepath)?);
             let mut decomp: Vec<u8> = Vec::new();
-            lzma_rs::xz_decompress(&mut f, &mut decomp).unwrap();
+            lzma_rs::xz_decompress(&mut f, &mut decomp)?;
 
-            (decomp.into(), filepath.parent().unwrap().to_path_buf())
+            Ok((decomp.into(), filepath.parent().context("no parent")?.to_path_buf()))
         } else {
-            (std::fs::read(&filepath).unwrap().into(), filepath.parent().unwrap().to_path_buf())
+            Ok((std::fs::read(&filepath)?.into(), filepath.parent().context("no parent")?.to_path_buf()))
         }
     }
 
     #[tokio::test]
-    async fn split_md_metadata_block_at_start_with_one_newline() {
+    async fn split_md_metadata_block_at_start_with_one_newline() -> Result<()> {
         let md = "\n---\ntoc: true\n---\n";
-        assert_eq!(md2mdblocks(md).await.unwrap().metadata.get("toc"), Some(&serde_yaml::Value::Bool(true)));
+        assert_eq!(md2mdblocks(md).await?.metadata.get("toc"), Some(&serde_yaml::Value::Bool(true)));
 
         let md = "\n\n---\ntoc: true\n---\n";
-        assert_eq!(md2mdblocks(md).await.unwrap().metadata.get("toc"), Some(&serde_yaml::Value::Bool(true)));
+        assert_eq!(md2mdblocks(md).await?.metadata.get("toc"), Some(&serde_yaml::Value::Bool(true)));
 
         let md = "\nasdf\n---\ntoc: true\n---\n";
-        assert_eq!(md2mdblocks(md).await.unwrap().metadata.get("toc"), None);
+        assert_eq!(md2mdblocks(md).await?.metadata.get("toc"), None);
 
         let md = "asdf\n---\ntoc: true\n---\n";
-        assert_eq!(md2mdblocks(md).await.unwrap().metadata.get("toc"), None);
+        assert_eq!(md2mdblocks(md).await?.metadata.get("toc"), None);
+
+        Ok(())
     }
 
     #[tokio::test]
-    async fn split_md_footnote_links() {
-        let (md, _) = read_file("footnotes-links.md");
-        let md = std::str::from_utf8(&md).unwrap();
-        let split = md2mdblocks(md).await.unwrap();
+    async fn split_md_footnote_links() -> Result<()> {
+        let (md, _) = read_file("footnotes-links.md")?;
+        let md = std::str::from_utf8(&md)?;
+        let split = md2mdblocks(md).await?;
         assert_eq!(split.blocks.len(), 5);
         assert_eq!(split.blocks[2].trim_end(), "---");
         assert_eq!(
@@ -598,72 +600,80 @@ mod tests {
                 \n\
                 [^4]: footnote with $x\\\\y=1$ math and stuff $\\frac12 = x$");
         assert_eq!(split.metadata.len(), 0);
+        Ok(())
     }
 
     #[tokio::test]
-    async fn split_md_multiple_metablocks() {
-        let (md, _) = read_file("multiple-metablocks.md");
-        let md = std::str::from_utf8(&md).unwrap();
-        let split = md2mdblocks(md).await.unwrap();
+    async fn split_md_multiple_metablocks() -> Result<()> {
+        let (md, _) = read_file("multiple-metablocks.md")?;
+        let md = std::str::from_utf8(&md)?;
+        let split = md2mdblocks(md).await?;
         assert_eq!(split.blocks.len(), 6);
         assert_eq!(split.metadata.len(), 4);
         assert_eq!(split.metadata.get("title"), Some(&serde_yaml::Value::String("my title".to_string())));
+        Ok(())
     }
 
     #[tokio::test]
-    async fn md2htmlblocks_basic() {
-        let (md, cwd) = read_file("basic.md");
+    async fn md2htmlblocks_basic() -> Result<()> {
+        let (md, cwd) = read_file("basic.md")?;
         let fpath = cwd.join("basic.md");
-        let (json, _) = md2htmlblocks(md, fpath.as_path(), fpath.parent().unwrap()).await.unwrap();
-        let json: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let (json, _) = md2htmlblocks(md, fpath.as_path(), fpath.parent().context("no parent")?).await?;
+        let json: serde_json::Value = serde_json::from_str(&json)?;
         assert_eq!(
-            json.get("htmlblocks").unwrap().as_array().unwrap()[1].as_array().unwrap()[1].as_str().unwrap().trim_end(),
+            json.get("htmlblocks").context("no htmlblocks")?.as_array().context("no array")?[1].as_array().context("no array")?[1].as_str().context("no str")?.trim_end(),
             "<p>test</p>"
         );
+        Ok(())
     }
 
     #[tokio::test]
-    async fn md2htmlblocks_multiple_meta() {
-        let (md, cwd) = read_file("multiple-metablocks.md");
+    async fn md2htmlblocks_multiple_meta() -> Result<()> {
+        let (md, cwd) = read_file("multiple-metablocks.md")?;
         let fpath = cwd.join("multiple-metablocks.md");
-        let (json, _) = md2htmlblocks(md, fpath.as_path(), fpath.parent().unwrap()).await.unwrap();
+        let (json, _) = md2htmlblocks(md, fpath.as_path(), fpath.parent().context("no parent")?).await?;
 
-        let json: serde_json::Value = serde_json::from_str(&json).unwrap();
-        assert_eq!(json.get("toc").unwrap(), &serde_json::Value::Bool(true));
-        assert_eq!(json.get("reference-section-title").unwrap(), &serde_json::Value::String("My reference title".to_string()));
+        let json: serde_json::Value = serde_json::from_str(&json)?;
+        assert_eq!(json.get("toc").context("no toc")?, &serde_json::Value::Bool(true));
+        assert_eq!(json.get("reference-section-title").context("no ref section title")?, &serde_json::Value::String("My reference title".to_string()));
+        Ok(())
     }
 
     #[tokio::test]
-    async fn md2htmlblocks_twobibs_toc_relative_link() {
-        let (md, cwd) = read_file("two-bibs-toc-relative-link.md");
+    async fn md2htmlblocks_twobibs_toc_relative_link() -> Result<()> {
+        let (md, cwd) = read_file("two-bibs-toc-relative-link.md")?;
         let fpath = cwd.join("citations.md");
-        let (json, citeproc_handle) = md2htmlblocks(md, fpath.as_path(), fpath.parent().unwrap()).await.unwrap();
+        let (json, citeproc_handle) = md2htmlblocks(md, fpath.as_path(), fpath.parent().context("no parent")?).await?;
 
-        let json: serde_json::Value = serde_json::from_str(&json).unwrap();
-        let (expected, _) = read_file("two-bibs-toc-relative-link-linkblock.html");
+        let json: serde_json::Value = serde_json::from_str(&json)?;
+        let (expected, _) = read_file("two-bibs-toc-relative-link-linkblock.html")?;
         // TODO: 3->4 after implementing title block
         assert_eq!(
-            json.get("htmlblocks").unwrap().as_array().unwrap()[3].as_array().unwrap()[1].as_str().unwrap().trim_end(),
-            std::str::from_utf8(&expected).unwrap().replace("{cwd}", cwd.to_str().unwrap()).trim_end()
+            json.get("htmlblocks").context("no htmlblocks")?.as_array().context("no array")?[3].as_array().context("no array")?[1].as_str().context("no str")?.trim_end(),
+            std::str::from_utf8(&expected)?.replace("{cwd}", cwd.to_str().context("non-utf8 cwd")?).trim_end()
         );
 
-        let citeproc_out = citeproc_handle.await.unwrap();
-        let citeproc_msg: serde_json::Value = serde_json::from_str(&citeproc_out).unwrap();
-        let (expected, _) = read_file("two-bibs-toc-relative-link-citeproc.html");
-        assert_eq!(citeproc_msg["html"], std::str::from_utf8(&expected).unwrap());
+        let citeproc_out = citeproc_handle.await?;
+        let citeproc_msg: serde_json::Value = serde_json::from_str(&citeproc_out)?;
+        let (expected, _) = read_file("two-bibs-toc-relative-link-citeproc.html")?;
+        assert_eq!(citeproc_msg["html"], std::str::from_utf8(&expected)?);
+
+        Ok(())
     }
 
     #[tokio::test]
-    async fn md2htmlblocks_bib() {
-        let (md, cwd) = read_file("citations.md");
+    async fn md2htmlblocks_bib() -> Result<()> {
+        let (md, cwd) = read_file("citations.md")?;
         let fpath = cwd.join("citations.md");
-        let (_, citeproc_handle) = md2htmlblocks(md, fpath.as_path(), fpath.parent().unwrap()).await.unwrap();
-        let citeproc_out = citeproc_handle.await.unwrap();
-        let citeproc_msg: serde_json::Value = serde_json::from_str(&citeproc_out).unwrap();
+        let (_, citeproc_handle) = md2htmlblocks(md, fpath.as_path(), fpath.parent().context("no parent")?).await?;
+        let citeproc_out = citeproc_handle.await?;
+        let citeproc_msg: serde_json::Value = serde_json::from_str(&citeproc_out)?;
 
-        let (expected, _) = read_file("citations-citeproc.html");
+        let (expected, _) = read_file("citations-citeproc.html")?;
 
-        assert_eq!(citeproc_msg["html"], std::str::from_utf8(&expected).unwrap());
+        assert_eq!(citeproc_msg["html"], std::str::from_utf8(&expected)?);
+
+        Ok(())
     }
 
     // TODO: test for title
