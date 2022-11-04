@@ -36,3 +36,5 @@ tracing-subscriber = "0.3"
 
 [dev-dependencies]
 lzma-rs = "0.2"
+tempfile = "3"
+libc = "0.2"
