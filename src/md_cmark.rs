@@ -86,15 +86,30 @@ fn try_parse_yaml_metadata_block(md: &str, start: usize) -> Option<(usize, Metad
         return None
     }
     
-    // It must end with \n---\n or \n...\n
-    // TODO: avoid scanning to end for nothing if it's \n...\n?
-    let length = md[start+4..].find("\n---\n").or_else(|| md[start+4..].find("\n...\n"))?;
-    let end = start+4+length;
+    // It must end with \n---\n or \n...\n or \n---EOF or \n...EOF
+    // TODO: avoid scanning to end for nothing if it's \n...\n|EOF?
+    let mut end = start+4;
+    loop {
+        let length = if let Some(length) = md[end..].find("\n---").or_else(|| md[end..].find("\n...")) {
+            length
+        } else {
+            return None;
+        };
+        end = end+length+4;
+
+        if end == md.len() {
+            // \n---EOF or \n...EOF
+            break;
+        } else if md[end..].starts_with("\n") {
+            // \n---\n or \n...\n
+            break;
+        }
+    }
 
     // It must be valid yaml
-    let yaml = serde_yaml::from_str(&md[start+4..end]).ok()?;
+    let yaml = serde_yaml::from_str(&md[start+4..end-4]).ok()?;
 
-    Some((end+5, yaml))
+    Some((end+1, yaml))
 }
 
 #[cached(result=true, size=10, key="u64", convert="{
@@ -651,6 +666,15 @@ mod tests {
 
         let md = "asdf\n---\ntoc: true\n---\n";
         assert_eq!(md2mdblocks(md).await?.metadata.get("toc"), None);
+
+        let md = "\n---\ntoc: true\n---";
+        assert_eq!(md2mdblocks(md).await?.metadata.get("toc"), Some(&serde_yaml::Value::Bool(true)));
+
+        let md = "\n---\ntoc: true\n---\n\nasdf";
+        let split_md = md2mdblocks(md).await?;
+        assert_eq!(split_md.metadata.get("toc"), Some(&serde_yaml::Value::Bool(true)));
+        assert_eq!(split_md.blocks.len(), 1);
+        assert_eq!(split_md.blocks[0], "asdf\n");
 
         Ok(())
     }
