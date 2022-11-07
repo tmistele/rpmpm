@@ -32,7 +32,8 @@ type Metadata = std::collections::HashMap<String, serde_yaml::Value>;
 #[derive(Clone)]
 struct SplitMarkdown {
     metadata: Metadata,
-    blocks: Vec<String>
+    blocks: Vec<String>,
+    titleblock: Option<String>,
 }
 
 impl<'a> SplitMarkdown {
@@ -102,10 +103,35 @@ fn try_parse_yaml_metadata_block(md: &str, start: usize) -> Option<(usize, Metad
     hasher.finish()
 }")]
 async fn md2mdblocks(md: &str) -> Result<SplitMarkdown> {
+
+    // Parse titleblock
+    let (titleblock, md) = if md.starts_with('%') {
+        let mut end = 0;
+        let mut title = &md[1..];
+        loop {
+            let lineend = if let Some(lineend) = title.find('\n') {
+                lineend
+            } else {
+                end += title.len()+1;
+                return Ok(SplitMarkdown {
+                    metadata: std::collections::HashMap::new(),
+                    blocks: Vec::new(),
+                    titleblock: Some(md[0..end].to_string()),
+                })
+            };
+            title = &title[lineend+1..];
+            end += lineend+1;
+            if ! title.starts_with('%') && ! title.starts_with(' ') {
+                break;
+            }
+        }
+        (Some(md[0..end].to_string()), &md[end+1..])
+    } else {
+        (None, md)
+    };
+
     // TODO: Can there be nested FootenoteDefinitions? I don't think so
 
-    // TODO: Manualy parse title block with % prefix?
-    
     let mut options = pulldown_cmark::Options::empty();
     options.insert(pulldown_cmark::Options::ENABLE_FOOTNOTES);
 
@@ -270,6 +296,7 @@ async fn md2mdblocks(md: &str) -> Result<SplitMarkdown> {
     Ok(SplitMarkdown {
         metadata: metadata.unwrap_or_else(|| std::collections::HashMap::new()),
         blocks: blocks,
+        titleblock: titleblock,
     })
 }
 
@@ -350,6 +377,48 @@ async fn mdblock2htmlblock(md_block: &str, hash: u64, cwd: &Path) -> Result<Html
         hash: hash
     })
 }
+
+#[cached(result=true, size=8192, key="u64", convert="{hash}")]
+async fn titleblock2htmlblock(titleblock: &Vec<u8>, hash: u64, cwd: &Path) -> Result<Option<Htmlblock>> {
+    let mut cmd = Command::new("pandoc");
+    cmd
+        .current_dir(cwd)
+        .arg("--from").arg("markdown+emoji")
+        .arg("--to").arg("html5")
+        .arg("--standalone")
+        .arg("--katex");
+
+    cmd.stdout(std::process::Stdio::piped());
+    cmd.stdin(std::process::Stdio::piped());
+
+    let mut child = cmd.spawn()?;
+    let mut stdin = child.stdin.take().expect("stdin take failed");
+
+    stdin.write_all(titleblock).await?;
+
+    // Send EOF to child
+    drop(stdin);
+
+    let out = child.wait_with_output().await?;
+    let out = String::from_utf8(out.stdout)?;
+
+    let fragment = scraper::Html::parse_fragment(&out);
+    lazy_static! {
+        static ref TITLE_SELECTOR: scraper::Selector = scraper::Selector::parse("header#title-block-header").unwrap();
+    }
+
+    if let Some(element) = fragment.select(&TITLE_SELECTOR).next() {
+        Ok(Some(Htmlblock {
+            html: element.html(),
+            citeblocks: "".to_string(),
+            hash: hash
+        }))
+    } else {
+        Ok(None)
+
+    }
+}
+
 
 const BIBKEYS: &'static [&'static str] = &["bibliography", "csl", "link-citations", "nocite", "references"];
 
@@ -462,6 +531,8 @@ struct NewContentMessage<'a> {
     reference_section_title: &'a str,
 }
 
+const TITLEKEYS: &'static [&'static str] = &["title", "subtitle", "author", "date"];
+
 // no cache, checks for bib differences
 pub async fn md2htmlblocks<'a>(md: Bytes, fpath: &Path, cwd: &'a Path) -> Result<(String, impl futures::Future<Output = Result<String> > + 'a)> {
 
@@ -480,40 +551,39 @@ pub async fn md2htmlblocks<'a>(md: Bytes, fpath: &Path, cwd: &'a Path) -> Result
     // Don't await htmlblocks right away so they can run in parallel with titleblock
     //
     // Note: The hot path during editing is (I think) most blocks = cached and one is
-    // changed. Thus, all but one of the json2htmlblock calls will be cached.
+    // changed. Thus, all but one of the mdblock2htmlblock calls will be cached.
     // So `tokio::spawn`ing them here is probably not worth it and will just
     // generate overhead?
     let htmlblocks = futures::future::try_join_all(htmlblocks);
 
-    /*
-    let (mut htmlblocks, titleblock) = if doc.meta.contains_key("title") {
+    let (mut htmlblocks, titleblock) = if split_md.titleblock.is_some() || split_md.metadata.contains_key("title") {
 
         // add title block, if any
-        let titledoc = PandocDoc {
-            pandoc_api_version: doc.pandoc_api_version,
-            blocks: vec![],
-            meta: {
-                let mut cloned = doc.meta.clone();
-                cloned.retain(|k, _| TITLEKEYS.contains(&k.as_str()));
-                cloned
-            }
-        };
-        let titlejson = serde_json::to_vec(&titledoc)?;
+        let mut cloned_yaml_metadata = split_md.metadata.clone();
+        cloned_yaml_metadata.retain(|k, _| TITLEKEYS.contains(&k.as_str()));
+
+        // TODO: add capacity?
+        let mut buf = Vec::new();
+
+        // write titleblock
+        if let Some(ref titleblock) = split_md.titleblock {
+            write!(buf, "{}\n", titleblock)?;
+        }
+        // write metadata block
+        write!(&mut buf, "---\n{}---\n\n", &serde_yaml::to_string(&cloned_yaml_metadata)?)?;
+
         let titleblock = {
             let mut hasher = DefaultHasher::new();
-            titlejson.hash(&mut hasher);
+            buf.hash(&mut hasher);
             cwd.hash(&mut hasher);
             let hash = hasher.finish();
-            json2titleblock(&titlejson, hash, cwd)
+            titleblock2htmlblock(&buf, hash, cwd)
         };
 
         futures::try_join!(htmlblocks, titleblock)?
     } else {
         (htmlblocks.await?, None)
     };
-    // TODO: titleblock
-    */
-    let (mut htmlblocks, titleblock) = (htmlblocks.await?, None);
 
     if let Some(titleblock) = titleblock {
         htmlblocks.insert(0, titleblock);
@@ -584,6 +654,28 @@ mod tests {
 
         Ok(())
     }
+
+    #[tokio::test]
+    async fn split_md_titleblock() -> Result<()> {
+        let md = "%asdf1\n asdf2\n asdf3\nasdf4";
+        let split_md = md2mdblocks(md).await?;
+        assert_eq!(split_md.titleblock, Some("%asdf1\n asdf2\n asdf3".to_string()));
+        assert_eq!(split_md.blocks.len(), 1);
+        assert_eq!(split_md.blocks[0], "asdf4\n");
+        assert_eq!(split_md.metadata.len(), 0);
+
+        let md = "%asdf1\n asdf2";
+        assert_eq!(md2mdblocks(md).await?.titleblock, Some("%asdf1\n asdf2".to_string()));
+
+        let md = " %asdf1\n asdf2";
+        assert_eq!(md2mdblocks(md).await?.titleblock, None);
+
+        let md = "asdf\n%asdf1\n asdf2";
+        assert_eq!(md2mdblocks(md).await?.titleblock, None);
+
+        Ok(())
+    }
+
 
     #[tokio::test]
     async fn split_md_footnote_links() -> Result<()> {
@@ -676,5 +768,16 @@ mod tests {
         Ok(())
     }
 
-    // TODO: test for title
+    #[tokio::test]
+    async fn md2htmlblocks_title() -> Result<()> {
+        let (md, cwd) = read_file("title.md")?;
+        let fpath = cwd.join("title.md");
+        let (new_content, _) = md2htmlblocks(md, fpath.as_path(), fpath.parent().context("no parent")?).await?;
+        let new_content: serde_json::Value = serde_json::from_str(&new_content)?;
+
+        let (expected, _) = read_file("title-title.html")?;
+
+        assert_eq!(new_content["htmlblocks"][0][1], std::str::from_utf8(&expected)?);
+        Ok(())
+    }
 }
