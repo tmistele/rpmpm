@@ -90,11 +90,7 @@ fn try_parse_yaml_metadata_block(md: &str, start: usize) -> Option<(usize, Metad
     // TODO: avoid scanning to end for nothing if it's \n...\n|EOF?
     let mut end = start+4;
     loop {
-        let length = if let Some(length) = md[end..].find("\n---").or_else(|| md[end..].find("\n...")) {
-            length
-        } else {
-            return None;
-        };
+        let length = md[end..].find("\n---").or_else(|| md[end..].find("\n..."))?;
         end = end+length+4;
 
         if end == md.len() {
