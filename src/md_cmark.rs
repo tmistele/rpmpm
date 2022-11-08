@@ -713,6 +713,43 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore] // TODO: Stop ignoring once fix is implemented
+    async fn split_md_list_item_with_gap() -> Result<()> {
+        let (md, _) = read_file("list-item-with-gap.md")?;
+        let md = std::str::from_utf8(&md)?;
+        let split = md2mdblocks(md).await?;
+        // TODO: Fix this
+        //
+        //       Note: Parsing this exactly like markdown may be a bit tricky (why does
+        //       the third code block terminate the list but not the other two?)
+        //
+        //       BUT: We can just err on the side of concatenating a few too many blocks!
+        //
+        //       Because if we fail to split a few blocks that's at most a perf problem.
+        //       Correctness will not be affected in this case. And the perf problem is
+        //       problem very minor if we only concat a few small blocks.
+        //
+        //       So we can probably get away with a simple rule like "continue list as
+        //       longas following level-0 tags or standalone blocks are indented".
+        assert_eq!(split.blocks.len(), 4);
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[ignore] // TODO: Stop ignoring once fix is implemented
+    async fn split_md_footnote_defs_without_blank_line() -> Result<()> {
+        let (md, _) = read_file("footnote-defs-without-blank-line.md")?;
+        let md = std::str::from_utf8(&md)?;
+        let split = md2mdblocks(md).await?;
+        // TODO: Fix this
+        assert_eq!(split.blocks.len(), 2);
+        assert_eq!(split.blocks[0], "Hi [^1]\n\n[^1]: footnote 1\n");
+        assert_eq!(split.blocks[1], "Ho [^2]\n\n[^2]: footnote 2\n");
+        Ok(())
+    }
+
+
+    #[tokio::test]
     async fn md2htmlblocks_basic() -> Result<()> {
         let (md, cwd) = read_file("basic.md")?;
         let fpath = cwd.join("basic.md");
