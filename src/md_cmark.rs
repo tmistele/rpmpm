@@ -763,9 +763,8 @@ mod tests {
 
         let json: serde_json::Value = serde_json::from_str(&json)?;
         let (expected, _) = read_file("two-bibs-toc-relative-link-linkblock.html")?;
-        // TODO: 3->4 after implementing title block
         assert_eq!(
-            json.get("htmlblocks").context("no htmlblocks")?.as_array().context("no array")?[3].as_array().context("no array")?[1].as_str().context("no str")?.trim_end(),
+            json.get("htmlblocks").context("no htmlblocks")?.as_array().context("no array")?[4].as_array().context("no array")?[1].as_str().context("no str")?.trim_end(),
             std::str::from_utf8(&expected)?.replace("{cwd}", cwd.to_str().context("non-utf8 cwd")?).trim_end()
         );
 
