@@ -38,27 +38,13 @@ struct SplitMarkdown {
 
 impl<'a> SplitMarkdown {
     fn get_meta_flag(&self, name: &str) -> bool {
-        if let Some(val) = self.metadata.get(name) {
-            if let serde_yaml::Value::Bool(val) = val {
-                *val
-            } else {
-                false
-            }
-        } else {
-            false
-        }
+        self.metadata.get(name)
+            .map(|val| val.as_bool().unwrap_or(false))
+            .unwrap_or(false)
     }
 
     fn get_meta_str(&'a self, name: &str) -> Option<&'a str> {
-        if let Some(val) = self.metadata.get(name) {
-            if let serde_yaml::Value::String(val) = val {
-                Some(val)
-            } else {
-                None
-            }
-        } else {
-            None
-        }
+        self.metadata.get(name)?.as_str()
     }
 }
 
