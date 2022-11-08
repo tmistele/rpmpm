@@ -720,17 +720,17 @@ mod tests {
         let split = md2mdblocks(md).await?;
         // TODO: Fix this
         //
-        //       Note: Parsing this exactly like markdown may be a bit tricky (why does
+        //       Note: Parsing this exactly like pandoc may be a bit tricky (why does
         //       the third code block terminate the list but not the other two?)
         //
         //       BUT: We can just err on the side of concatenating a few too many blocks!
         //
         //       Because if we fail to split a few blocks that's at most a perf problem.
         //       Correctness will not be affected in this case. And the perf problem is
-        //       problem very minor if we only concat a few small blocks.
+        //       probably very minor if we only concat a few small blocks.
         //
         //       So we can probably get away with a simple rule like "continue list as
-        //       longas following level-0 tags or standalone blocks are indented".
+        //       long as the following level-0 tags or standalone blocks are indented".
         assert_eq!(split.blocks.len(), 4);
         Ok(())
     }
