@@ -7,16 +7,16 @@ use crate::md_cmark::md2htmlblocks;
 
 use tracing::{trace, warn};
 
-use std::net::{SocketAddr, Ipv4Addr};
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
-use std::path::{PathBuf, Path};
+use std::net::{Ipv4Addr, SocketAddr};
 use std::os::unix::fs::FileTypeExt;
-use std::os::unix::io::{RawFd, IntoRawFd, FromRawFd};
+use std::os::unix::io::{FromRawFd, IntoRawFd, RawFd};
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
 use libsystemd::activation::IsType;
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{anyhow, Context, Result};
 
 use futures_channel::mpsc::{unbounded, UnboundedSender};
 use futures_util::{future, pin_mut, stream::TryStreamExt, StreamExt};
@@ -31,7 +31,12 @@ use bytes::{Bytes, BytesMut};
 type Tx = UnboundedSender<Message>;
 type PeerMap = Arc<Mutex<HashMap<SocketAddr, Tx>>>;
 
-async fn new_websocket_content(msg: String, home: &Path, peer_map: &PeerMap, queue: &Queue) -> Result<()> {
+async fn new_websocket_content(
+    msg: String,
+    home: &Path,
+    peer_map: &PeerMap,
+    queue: &Queue,
+) -> Result<()> {
     if !msg.starts_with("filepath:") {
         trace!("Received unknown TEXT message: {}", msg);
         return Ok(());
@@ -47,10 +52,12 @@ async fn new_websocket_content(msg: String, home: &Path, peer_map: &PeerMap, que
 
             trace!("Got data from file {}", &msg[9..]);
             submit_new_content(&peer_map, &queue, new_content);
-        },
+        }
         Err(e) => {
             trace!("Could not load data from file {}", &msg[9..]);
-            let msg = serde_json::to_string(&ErrMsg { error: format!("{}", e)})?;
+            let msg = serde_json::to_string(&ErrMsg {
+                error: format!("{}", e),
+            })?;
             let msg = Message::text(msg);
 
             trace!("sending Err from filepath request to clients!");
@@ -60,7 +67,14 @@ async fn new_websocket_content(msg: String, home: &Path, peer_map: &PeerMap, que
     Ok(())
 }
 
-async fn handle_connection(stream: TcpStream, addr: SocketAddr, secret: String, peer_map: PeerMap, queue: Queue, home: PathBuf) -> Result<()>  {
+async fn handle_connection(
+    stream: TcpStream,
+    addr: SocketAddr,
+    secret: String,
+    peer_map: PeerMap,
+    queue: Queue,
+    home: PathBuf,
+) -> Result<()> {
     trace!("incoming connection");
     let mut ws_stream = tokio_tungstenite::accept_async(stream)
         .await
@@ -83,7 +97,7 @@ async fn handle_connection(stream: TcpStream, addr: SocketAddr, secret: String, 
     peer_map.lock().unwrap().insert(addr, tx);
 
     let (outgoing, incoming) = ws_stream.split();
-    
+
     // Handle incoming messages from this client's websocket until stream closes
     let wait_incoming = incoming.try_for_each(|msg| async {
         if let Message::Text(msg) = msg {
@@ -118,7 +132,7 @@ async fn handle_connection(stream: TcpStream, addr: SocketAddr, secret: String, 
 
 #[derive(Serialize, Debug)]
 struct StatusMsg<'a> {
-    status: &'a str
+    status: &'a str,
 }
 
 async fn progressbar(peer_map: PeerMap) -> Result<()> {
@@ -127,7 +141,9 @@ async fn progressbar(peer_map: PeerMap) -> Result<()> {
     loop {
         tokio::time::sleep(duration).await;
         i += 1;
-        let msg = Message::text(serde_json::to_string(&StatusMsg{status: &" 🞄 ".repeat(i)})?);
+        let msg = Message::text(serde_json::to_string(&StatusMsg {
+            status: &" 🞄 ".repeat(i),
+        })?);
 
         trace!("sending PROGRESS to clients!");
         send_message_to_all_clients(&peer_map, msg).await?;
@@ -136,7 +152,7 @@ async fn progressbar(peer_map: PeerMap) -> Result<()> {
 
 #[derive(Serialize, Debug)]
 struct ErrMsg {
-    error: String
+    error: String,
 }
 
 struct NewContent {
@@ -172,13 +188,21 @@ async fn process_new_content(peer_map: PeerMap, queue: Queue, mut new: NewConten
             let jsonmessage = md2htmlblocks(
                 new.md,
                 new.fpath.as_path(),
-                new.fpath.parent().context("could not get parent of filepath")?
-            ).await;
+                new.fpath
+                    .parent()
+                    .context("could not get parent of filepath")?,
+            )
+            .await;
             progressbar.abort();
 
             let (msg, citeproc_handle) = match jsonmessage {
-                Err(ref e) => (serde_json::to_string(&ErrMsg { error: format!("{}", e)})?, None),
-                Ok((jsonmessage, citeproc_handle)) => (jsonmessage, Some(citeproc_handle))
+                Err(ref e) => (
+                    serde_json::to_string(&ErrMsg {
+                        error: format!("{}", e),
+                    })?,
+                    None,
+                ),
+                Ok((jsonmessage, citeproc_handle)) => (jsonmessage, Some(citeproc_handle)),
             };
             let msg = Message::text(msg);
 
@@ -241,15 +265,12 @@ fn submit_new_content(peer_map: &PeerMap, queue: &Queue, new: NewContent) {
 }
 
 struct NewPipeContentCodec<'a> {
-    home: &'a Path
+    home: &'a Path,
 }
 
 impl NewPipeContentCodec<'_> {
-
     fn new<'a>(home: &'a Path) -> NewPipeContentCodec<'a> {
-        NewPipeContentCodec {
-            home: home
-        }
+        NewPipeContentCodec { home: home }
     }
 
     fn parse_pipe_content(&self, mut buf: BytesMut) -> Result<NewContent> {
@@ -258,8 +279,8 @@ impl NewPipeContentCodec<'_> {
         let (content, fpath) = if buf.starts_with(b"<!-- filepath:") {
             let lineend = &buf[14..].iter().position(|&x| x == b'\n');
             if let Some(lineend) = lineend {
-                let split = 14+*lineend+1;
-                let fpath = home.join(std::str::from_utf8(&buf[14..split-5])?);
+                let split = 14 + *lineend + 1;
+                let fpath = home.join(std::str::from_utf8(&buf[14..split - 5])?);
                 (buf.split_off(split), fpath)
             } else {
                 (buf, home.join("LIVE"))
@@ -270,7 +291,7 @@ impl NewPipeContentCodec<'_> {
 
         Ok(NewContent {
             fpath: fpath,
-            md: content.freeze()
+            md: content.freeze(),
         })
     }
 }
@@ -282,12 +303,12 @@ impl tokio_util::codec::Decoder for NewPipeContentCodec<'_> {
     fn decode(&mut self, buf: &mut BytesMut) -> Result<Option<Self::Item>> {
         if !buf.is_empty() {
             if buf.last().unwrap() == &0 {
-                trace!("got data, len = {}, emitting new content", buf.len()-1);
+                trace!("got data, len = {}, emitting new content", buf.len() - 1);
                 // First take out complete buffer
                 let mut buf = buf.split();
                 let len = buf.len();
                 // Then omit last byte since we don't want to \0
-                let new_content = self.parse_pipe_content(buf.split_to(len-1))?;
+                let new_content = self.parse_pipe_content(buf.split_to(len - 1))?;
                 Ok(Some(new_content))
             } else {
                 trace!("got data, len = {}, but waiting for \\0", buf.len());
@@ -310,8 +331,13 @@ impl tokio_util::codec::Decoder for NewPipeContentCodec<'_> {
     }
 }
 
-async fn monitorpipe(file: Option<tokio::fs::File>, pipe: PathBuf, peer_map: PeerMap, queue: Queue, home: PathBuf) -> Result<()> {
-
+async fn monitorpipe(
+    file: Option<tokio::fs::File>,
+    pipe: PathBuf,
+    peer_map: PeerMap,
+    queue: Queue,
+    home: PathBuf,
+) -> Result<()> {
     // Start with pre-opened file from systemd fd, if any
     let mut file = if let Some(file) = file {
         file
@@ -325,7 +351,10 @@ async fn monitorpipe(file: Option<tokio::fs::File>, pipe: PathBuf, peer_map: Pee
 
     loop {
         let mut pipe_stream = tokio_util::codec::FramedRead::with_capacity(
-            file, NewPipeContentCodec::new(&home), 65_536);
+            file,
+            NewPipeContentCodec::new(&home),
+            65_536,
+        );
         while let Some(read) = pipe_stream.next().await {
             let new_content = read?;
             trace!("got new content!");
@@ -349,7 +378,7 @@ async fn monitorpipe(file: Option<tokio::fs::File>, pipe: PathBuf, peer_map: Pee
     }
 }
 
-fn read_socket_activation_fds() -> (Option<RawFd>,Option<RawFd>) {
+fn read_socket_activation_fds() -> (Option<RawFd>, Option<RawFd>) {
     // We use `unset_env = true` to prevent accidentally using the same `RawFd` twice
     if let Ok(fds) = libsystemd::activation::receive_descriptors(true /* unset_env */) {
         // TODO: Do better validation?
@@ -368,24 +397,35 @@ fn read_socket_activation_fds() -> (Option<RawFd>,Option<RawFd>) {
     }
 }
 
-fn print_client_autodiscovery(port: u16, secret: &str,  runtime_dir: &Path, pipe_path: &Path) -> Result<()> {
-
+fn print_client_autodiscovery(
+    port: u16,
+    secret: &str,
+    runtime_dir: &Path,
+    pipe_path: &Path,
+) -> Result<()> {
     // TODO: CARGO_MANIFEST_DIR only works when run with `cargo run`. What to do otherwise?
     let base_dir = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR")?);
 
     let client_path = std::fs::canonicalize(base_dir.join("src/../client/pmpm_revealjs.html"))?;
-    let client_path_str = client_path.to_str().context("could not convert client_path to str")?;
+    let client_path_str = client_path
+        .to_str()
+        .context("could not convert client_path to str")?;
     std::fs::write(runtime_dir.join("client_path_revealjs"), &client_path_str)?;
 
     let client_path = std::fs::canonicalize(base_dir.join("src/../client/pmpm.html"))?;
-    let client_path_str = client_path.to_str().context("could not convert client_path to str")?;
+    let client_path_str = client_path
+        .to_str()
+        .context("could not convert client_path to str")?;
     std::fs::write(runtime_dir.join("client_path"), &client_path_str)?;
 
     std::fs::write(runtime_dir.join("websocket_secret"), &secret)?;
     std::fs::write(runtime_dir.join("websocket_port"), format!("{}", port))?;
 
-    let pipe_path_str = pipe_path.to_str().context("could not convert pipe path to str")?;
-    println!("pmpm-websocket started (port {})\n\
+    let pipe_path_str = pipe_path
+        .to_str()
+        .context("could not convert pipe path to str")?;
+    println!(
+        "pmpm-websocket started (port {})\n\
               \n\
               Pipe new content to {}, for example\n\
                   echo '# Hello World!' > {}\n\
@@ -393,8 +433,17 @@ fn print_client_autodiscovery(port: u16, secret: &str,  runtime_dir: &Path, pipe
               Direct your browser to\n\
                   file://{}?secret={}{}\n\
               to view the rendered markdown",
-              port, pipe_path_str, pipe_path_str, client_path_str, secret,
-              if port == 9877 { "".to_string() } else { format!("&port={}", port) });
+        port,
+        pipe_path_str,
+        pipe_path_str,
+        client_path_str,
+        secret,
+        if port == 9877 {
+            "".to_string()
+        } else {
+            format!("&port={}", port)
+        }
+    );
 
     Ok(())
 }
@@ -404,13 +453,14 @@ pub async fn run(args: crate::Args) -> Result<()> {
     let server_addr = Ipv4Addr::new(127, 0, 0, 1);
 
     let home = args.home;
-    let runtime_dir = PathBuf::from(std::env::var("XDG_RUNTIME_DIR").unwrap_or("/tmp".to_string())).join("pmpm/");
+    let runtime_dir =
+        PathBuf::from(std::env::var("XDG_RUNTIME_DIR").unwrap_or("/tmp".to_string())).join("pmpm/");
     let pipe_path = runtime_dir.join("pipe");
 
     let peer_map = PeerMap::new(Mutex::new(HashMap::new()));
     let queue = Queue::new(Mutex::new(QueueStatus {
         processing: false,
-        new_content: None
+        new_content: None,
     }));
 
     // Maybe get pipe/websocket fds from systemd socket activation
@@ -440,8 +490,14 @@ pub async fn run(args: crate::Args) -> Result<()> {
     } else {
         None
     };
-    tokio::spawn(monitorpipe(file, pipe_path.clone(), peer_map.clone(), queue.clone(), home.clone()));
-    
+    tokio::spawn(monitorpipe(
+        file,
+        pipe_path.clone(),
+        peer_map.clone(),
+        queue.clone(),
+        home.clone(),
+    ));
+
     // Listener for websocket
     let listener = if let Some(fd) = fd_websocket {
         trace!("fd_websocket from systemd: {}!", fd);
@@ -461,9 +517,15 @@ pub async fn run(args: crate::Args) -> Result<()> {
 
     // Handle websocket connections
     while let Ok((stream, addr)) = listener.accept().await {
-        tokio::spawn(handle_connection(stream, addr, secret.clone(), peer_map.clone(), queue.clone(), home.clone()));
+        tokio::spawn(handle_connection(
+            stream,
+            addr,
+            secret.clone(),
+            peer_map.clone(),
+            queue.clone(),
+            home.clone(),
+        ));
     }
 
     Ok(())
 }
-

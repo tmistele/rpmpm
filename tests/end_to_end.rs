@@ -1,26 +1,25 @@
-use anyhow::{Result, Context};
+use anyhow::{Context, Result};
 
 use std::sync::{Arc, Mutex};
 
-use tracing::{trace, debug};
+use tracing::{debug, trace};
 
 use lazy_static::lazy_static;
 
 use tokio::process::Command;
 
 use tokio::net::TcpStream;
-use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, tungstenite::protocol::Message};
+use tokio_tungstenite::{tungstenite::protocol::Message, MaybeTlsStream, WebSocketStream};
 
-use serde_json::json;
 use serde::Deserialize;
+use serde_json::json;
 use serde_tuple::Deserialize_tuple;
-
 
 use futures::SinkExt;
 use futures_util::StreamExt;
 
 use rand::distributions::{Alphanumeric, DistString};
-use sha2::{Sha512, Digest};
+use sha2::{Digest, Sha512};
 
 use tokio::io::AsyncWriteExt;
 
@@ -77,7 +76,10 @@ struct PyNewContentMessage {
     reference_section_title: String,
 }
 
-async fn do_auth(ws_stream: &mut WebSocketStream<MaybeTlsStream<TcpStream>>, secret: &str) -> Result<()> {
+async fn do_auth(
+    ws_stream: &mut WebSocketStream<MaybeTlsStream<TcpStream>>,
+    secret: &str,
+) -> Result<()> {
     let msg = ws_stream.next().await.context("no websocket msg")??;
     let msg: serde_json::Value = serde_json::from_str(msg.to_text()?)?;
     let cnonce = generate_token();
@@ -93,8 +95,17 @@ async fn do_auth(ws_stream: &mut WebSocketStream<MaybeTlsStream<TcpStream>>, sec
     let msg: serde_json::Value = serde_json::from_str(msg.to_text()?)?;
 
     assert_eq!(
-        sha512hex(format!("{}{}{}", secret, challenge, msg["snonce"].as_str().context("no str")?).as_str()),
-        msg["hash"].as_str().context("no str")?);
+        sha512hex(
+            format!(
+                "{}{}{}",
+                secret,
+                challenge,
+                msg["snonce"].as_str().context("no str")?
+            )
+            .as_str()
+        ),
+        msg["hash"].as_str().context("no str")?
+    );
 
     Ok(())
 }
@@ -115,7 +126,6 @@ struct TestServer {
 }
 
 impl TestServer {
-
     fn new_port() -> u16 {
         let mut next_port = NEXT_PORT.lock().unwrap();
         let port = *next_port;
@@ -132,15 +142,17 @@ impl TestServer {
 
         let runtime_dir = tempfile::tempdir()?;
 
-        cmd
-            .env("XDG_RUNTIME_DIR", runtime_dir.path())
+        cmd.env("XDG_RUNTIME_DIR", runtime_dir.path())
             .kill_on_drop(true)
-            .arg("--port").arg(port.to_string());
+            .arg("--port")
+            .arg(port.to_string());
         let child = cmd.spawn()?;
 
         let mut secret = None;
         while secret.is_none() {
-            if let Ok(content) = std::fs::read_to_string(runtime_dir.path().join("pmpm/websocket_secret")) {
+            if let Ok(content) =
+                std::fs::read_to_string(runtime_dir.path().join("pmpm/websocket_secret"))
+            {
                 secret = Some(content);
             } else {
                 tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
@@ -148,8 +160,10 @@ impl TestServer {
         }
         let secret = secret.context("no secret")?;
 
-        let (mut ws_stream, _) = tokio_tungstenite::connect_async(format!("ws://127.0.0.1:{}/", port))
-            .await.expect("Failed to connect");
+        let (mut ws_stream, _) =
+            tokio_tungstenite::connect_async(format!("ws://127.0.0.1:{}/", port))
+                .await
+                .expect("Failed to connect");
         do_auth(&mut ws_stream, &secret).await?;
 
         Ok(TestServer {
@@ -181,14 +195,14 @@ impl TestServer {
         Self::new_from_command(cmd, true).await
     }
 
-
     async fn open_pipe(&self) -> tokio::fs::File {
         tokio::fs::OpenOptions::new()
             .read(false)
             .write(true)
             .custom_flags(libc::O_NONBLOCK)
             .open(self.runtime_dir.path().join("pmpm/pipe"))
-            .await.expect("Could not open named pipe")
+            .await
+            .expect("Could not open named pipe")
     }
 
     async fn md_to_pipe_with0(pipe: &mut tokio::fs::File, md: &mut Vec<u8>) {
@@ -212,7 +226,7 @@ impl TestServer {
 
                     // TODO: I don't understand this. But this seems to give the correct results?!
                     written -= last_n;
-                },
+                }
                 Err(e) => panic!("{}", e),
                 Ok(n) => {
                     // TODO: See comment above `while(...)`
@@ -235,8 +249,12 @@ impl Drop for TestServer {
             // Python version spawns additional processes that won't be killed by child.kill()
             std::process::Command::new("pmpm")
                 .arg("--stop")
-                .arg("--port").arg(self.port.to_string())
-                .spawn().unwrap().wait().unwrap();
+                .arg("--port")
+                .arg(self.port.to_string())
+                .spawn()
+                .unwrap()
+                .wait()
+                .unwrap();
         }
     }
 }
@@ -248,7 +266,7 @@ async fn basic_pipe_input_websocket_response() -> Result<()> {
     let mut pipe = ts.open_pipe().await;
 
     pipe.write_all(b"# hi\n\nhello\0").await?;
-    
+
     let msg = ts.ws_stream.next().await.context("no websocket msg")??;
     let msg: NewContentMessage = serde_json::from_str(msg.to_text()?)?;
     assert!(msg.filepath.ends_with("LIVE"));
@@ -272,7 +290,7 @@ async fn python_basic() -> Result<()> {
     let mut pipe = ts.open_pipe().await;
 
     pipe.write_all(b"# hi\n\nhello\0").await?;
-    
+
     let msg = loop {
         let msg = ts.ws_stream.next().await.context("no websocket msg")??;
         if !msg.to_text()?.starts_with("{\"html") {

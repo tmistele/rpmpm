@@ -1,8 +1,8 @@
-mod server;
 #[cfg(not(feature = "cmark"))]
 mod md;
 #[cfg(feature = "cmark")]
 mod md_cmark;
+mod server;
 
 use anyhow::Result;
 
@@ -21,7 +21,7 @@ pub struct Args {
     port: u16,
 
     /// Root folder of the server
-    #[arg(long, short='H', env="HOME")]
+    #[arg(long, short = 'H', env = "HOME")]
     home: PathBuf,
 }
 
