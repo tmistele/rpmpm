@@ -46,12 +46,12 @@ async fn new_websocket_content(
     match std::fs::read(&fpath) {
         Ok(content) => {
             let new_content = NewContent {
-                fpath: fpath,
+                fpath,
                 md: content.into(),
             };
 
             trace!("Got data from file {}", &msg[9..]);
-            submit_new_content(&peer_map, &queue, new_content);
+            submit_new_content(peer_map, queue, new_content);
         }
         Err(e) => {
             trace!("Could not load data from file {}", &msg[9..]);
@@ -61,7 +61,7 @@ async fn new_websocket_content(
             let msg = Message::text(msg);
 
             trace!("sending Err from filepath request to clients!");
-            send_message_to_all_clients(&peer_map, msg).await?;
+            send_message_to_all_clients(peer_map, msg).await?;
         }
     };
     Ok(())
@@ -84,7 +84,7 @@ async fn handle_connection(
     // First authenticate client, then work with it
     {
         let auth_result = auth::try_auth_client(&mut ws_stream, &secret).await;
-        if let Ok(_) = auth_result {
+        if auth_result.is_ok() {
             // ok
         } else {
             // not ok
@@ -269,8 +269,8 @@ struct NewPipeContentCodec<'a> {
 }
 
 impl NewPipeContentCodec<'_> {
-    fn new<'a>(home: &'a Path) -> NewPipeContentCodec<'a> {
-        NewPipeContentCodec { home: home }
+    fn new(home: &Path) -> NewPipeContentCodec {
+        NewPipeContentCodec { home }
     }
 
     fn parse_pipe_content(&self, mut buf: BytesMut) -> Result<NewContent> {
@@ -290,7 +290,7 @@ impl NewPipeContentCodec<'_> {
         };
 
         Ok(NewContent {
-            fpath: fpath,
+            fpath,
             md: content.freeze(),
         })
     }
@@ -410,15 +410,15 @@ fn print_client_autodiscovery(
     let client_path_str = client_path
         .to_str()
         .context("could not convert client_path to str")?;
-    std::fs::write(runtime_dir.join("client_path_revealjs"), &client_path_str)?;
+    std::fs::write(runtime_dir.join("client_path_revealjs"), client_path_str)?;
 
     let client_path = std::fs::canonicalize(base_dir.join("src/../client/pmpm.html"))?;
     let client_path_str = client_path
         .to_str()
         .context("could not convert client_path to str")?;
-    std::fs::write(runtime_dir.join("client_path"), &client_path_str)?;
+    std::fs::write(runtime_dir.join("client_path"), client_path_str)?;
 
-    std::fs::write(runtime_dir.join("websocket_secret"), &secret)?;
+    std::fs::write(runtime_dir.join("websocket_secret"), secret)?;
     std::fs::write(runtime_dir.join("websocket_port"), format!("{}", port))?;
 
     let pipe_path_str = pipe_path
@@ -454,7 +454,8 @@ pub async fn run(args: crate::Args) -> Result<()> {
 
     let home = args.home;
     let runtime_dir =
-        PathBuf::from(std::env::var("XDG_RUNTIME_DIR").unwrap_or("/tmp".to_string())).join("pmpm/");
+        PathBuf::from(std::env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| "/tmp".to_string()))
+            .join("pmpm/");
     let pipe_path = runtime_dir.join("pipe");
 
     let peer_map = PeerMap::new(Mutex::new(HashMap::new()));

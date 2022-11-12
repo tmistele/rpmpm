@@ -81,11 +81,10 @@ fn try_parse_yaml_metadata_block(md: &str, start: usize) -> Option<(usize, Metad
             .or_else(|| md[end..].find("\n..."))?;
         end = end + length + 4;
 
-        if end == md.len() {
-            // \n---EOF or \n...EOF
-            break;
-        } else if md[end..].starts_with("\n") {
-            // \n---\n or \n...\n
+        // \n---EOF or \n...EOF
+        // or
+        // \n---\n or \n...\n
+        if end == md.len() || md[end..].starts_with('\n') {
             break;
         }
     }
@@ -108,9 +107,8 @@ fn try_parse_yaml_metadata_block(md: &str, start: usize) -> Option<(usize, Metad
 )]
 async fn md2mdblocks(md: &str) -> Result<SplitMarkdown> {
     // Parse titleblock
-    let (titleblock, md) = if md.starts_with('%') {
+    let (titleblock, md) = if let Some(mut title) = md.strip_prefix('%') {
         let mut end = 0;
-        let mut title = &md[1..];
         loop {
             let lineend = if let Some(lineend) = title.find('\n') {
                 lineend
@@ -200,10 +198,10 @@ async fn md2mdblocks(md: &str) -> Result<SplitMarkdown> {
                     loop {
                         end = range.start
                             + md[range.start..end]
-                                .rfind("[")
+                                .rfind('[')
                                 .context("Missing [ in reference")?;
                         // label can contain ], it just has to be escaped as \]
-                        if end == 0 || !&md[end - 1..].starts_with("\\") {
+                        if end == 0 || !&md[end - 1..].starts_with('\\') {
                             break;
                         }
                     }
@@ -215,7 +213,7 @@ async fn md2mdblocks(md: &str) -> Result<SplitMarkdown> {
                     blocks.push(ParsedBlock {
                         footnote_references: current_block_footnote_references,
                         link_references: current_block_link_references,
-                        range: range,
+                        range,
                     });
                     current_block_footnote_references = Vec::new();
                     current_block_link_references = Vec::new();
@@ -247,7 +245,7 @@ async fn md2mdblocks(md: &str) -> Result<SplitMarkdown> {
                     blocks.push(ParsedBlock {
                         footnote_references: Vec::new(),
                         link_references: Vec::new(),
-                        range: range,
+                        range,
                     });
                 }
             }
@@ -259,7 +257,7 @@ async fn md2mdblocks(md: &str) -> Result<SplitMarkdown> {
                     blocks.push(ParsedBlock {
                         footnote_references: Vec::new(),
                         link_references: Vec::new(),
-                        range: range,
+                        range,
                     });
                 }
             }
@@ -300,12 +298,12 @@ async fn md2mdblocks(md: &str) -> Result<SplitMarkdown> {
 
             let mut buf = String::with_capacity(length);
             // block content
-            write!(buf, "{}\n", &md[block.range.start..block.range.end])?;
+            writeln!(buf, "{}", &md[block.range.start..block.range.end])?;
             // add definitions
             for label in &block.link_references {
                 // don't just unwrap in case of missing definition (common while typing!)
                 if let Some(range) = link_reference_definitions.get(*label) {
-                    write!(buf, "{}\n", &md[range.start..range.end])?;
+                    writeln!(buf, "{}", &md[range.start..range.end])?;
                 }
             }
             // add footnotes
@@ -321,9 +319,9 @@ async fn md2mdblocks(md: &str) -> Result<SplitMarkdown> {
         .collect::<Result<Vec<_>>>()?;
 
     Ok(SplitMarkdown {
-        metadata: metadata.unwrap_or_else(|| std::collections::HashMap::new()),
-        blocks: blocks,
-        titleblock: titleblock,
+        metadata: metadata.unwrap_or_default(),
+        blocks,
+        titleblock,
     })
 }
 
@@ -404,14 +402,14 @@ async fn mdblock2htmlblock(md_block: &str, hash: u64, cwd: &Path) -> Result<Html
 
     Ok(Htmlblock {
         html: out,
-        citeblocks: citeblocks,
-        hash: hash,
+        citeblocks,
+        hash,
     })
 }
 
 #[cached(result = true, size = 8192, key = "u64", convert = "{hash}")]
 async fn titleblock2htmlblock(
-    titleblock: &Vec<u8>,
+    titleblock: &[u8],
     hash: u64,
     cwd: &Path,
 ) -> Result<Option<Htmlblock>> {
@@ -448,14 +446,14 @@ async fn titleblock2htmlblock(
         Ok(Some(Htmlblock {
             html: element.html(),
             citeblocks: "".to_string(),
-            hash: hash,
+            hash,
         }))
     } else {
         Ok(None)
     }
 }
 
-const BIBKEYS: &'static [&'static str] = &[
+const BIBKEYS: &[&str] = &[
     "bibliography",
     "csl",
     "link-citations",
@@ -469,7 +467,7 @@ fn mtime_from_file(file: &str, cwd: &Path) -> Result<u64> {
         .modified()?
         .duration_since(std::time::SystemTime::UNIX_EPOCH)?
         .as_secs();
-    return Ok(mtime);
+    Ok(mtime)
 }
 
 async fn uniqueciteprocdict(
@@ -481,7 +479,7 @@ async fn uniqueciteprocdict(
     cloned_yaml_metadata.retain(|k, _| BIBKEYS.contains(&k.as_str()));
 
     // No bib
-    if cloned_yaml_metadata.len() <= 0 {
+    if cloned_yaml_metadata.is_empty() {
         return Ok(None);
     }
 
@@ -489,25 +487,25 @@ async fn uniqueciteprocdict(
     let mut buf = Vec::new();
 
     // write metadata block
-    write!(&mut buf, "---\n")?;
+    writeln!(&mut buf, "---")?;
 
     // add mtimes of bib files etc.
     match cloned_yaml_metadata.get("bibliography") {
         Some(serde_yaml::Value::String(bibfile)) => {
-            write!(
+            writeln!(
                 &mut buf,
-                "bibliography_mtime_: {}\n",
-                mtime_from_file(&bibfile, cwd)?
+                "bibliography_mtime_: {}",
+                mtime_from_file(bibfile, cwd)?
             )?;
         }
         Some(serde_yaml::Value::Sequence(bibs)) => {
             for (i, bibfile) in bibs.iter().enumerate() {
                 if let serde_yaml::Value::String(bibfile) = bibfile {
-                    write!(
+                    writeln!(
                         &mut buf,
-                        "bibliography_mtime_{}_: {}\n",
+                        "bibliography_mtime_{}_: {}",
                         i,
-                        mtime_from_file(&bibfile, cwd)?
+                        mtime_from_file(bibfile, cwd)?
                     )?;
                 }
             }
@@ -515,8 +513,8 @@ async fn uniqueciteprocdict(
         _ => {}
     }
     if let Some(serde_yaml::Value::String(cslfile)) = cloned_yaml_metadata.get("csl") {
-        let mtime = mtime_from_file(&cslfile, cwd)?;
-        write!(&mut buf, "csl_mtime_: {}\n", mtime)?;
+        let mtime = mtime_from_file(cslfile, cwd)?;
+        writeln!(&mut buf, "csl_mtime_: {}", mtime)?;
     }
 
     // write actual metadata
@@ -573,10 +571,7 @@ async fn citeproc(
         "".to_string()
     };
 
-    let message = NewCiteprocMessage {
-        bibid: bibid,
-        html: &out,
-    };
+    let message = NewCiteprocMessage { bibid, html: &out };
 
     let jsonmessage = serde_json::to_string(&message)?;
     Ok(jsonmessage)
@@ -596,7 +591,7 @@ struct NewContentMessage<'a> {
     reference_section_title: &'a str,
 }
 
-const TITLEKEYS: &'static [&'static str] = &["title", "subtitle", "author", "date"];
+const TITLEKEYS: &[&str] = &["title", "subtitle", "author", "date"];
 
 // no cache, checks for bib differences
 pub async fn md2htmlblocks<'a>(
@@ -635,7 +630,7 @@ pub async fn md2htmlblocks<'a>(
 
             // write titleblock
             if let Some(ref titleblock) = split_md.titleblock {
-                write!(buf, "{}\n", titleblock)?;
+                writeln!(buf, "{}", titleblock)?;
             }
             // write metadata block
             write!(
@@ -677,7 +672,7 @@ pub async fn md2htmlblocks<'a>(
             .to_str()
             .context("could not convert filepath to str")?, // TODO: relative to cwd?
         htmlblocks: &htmlblocks,
-        bibid: bibid,
+        bibid,
         suppress_bibliography: split_md.get_meta_flag("suppress-bibliography"),
         toc: split_md.get_meta_flag("toc"),
         toc_title: split_md.get_meta_str("toc-title"),

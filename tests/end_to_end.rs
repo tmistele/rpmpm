@@ -168,10 +168,10 @@ impl TestServer {
 
         Ok(TestServer {
             _child: child,
-            port: port,
-            runtime_dir: runtime_dir,
-            ws_stream: ws_stream,
-            is_python: is_python,
+            port,
+            runtime_dir,
+            ws_stream,
+            is_python,
         })
     }
 
@@ -207,7 +207,7 @@ impl TestServer {
 
     async fn md_to_pipe_with0(pipe: &mut tokio::fs::File, md: &mut Vec<u8>) {
         md.push(0);
-        Self::md_to_pipe(pipe, &md).await;
+        Self::md_to_pipe(pipe, md).await;
         md.pop();
     }
 
@@ -270,8 +270,8 @@ async fn basic_pipe_input_websocket_response() -> Result<()> {
     let msg = ts.ws_stream.next().await.context("no websocket msg")??;
     let msg: NewContentMessage = serde_json::from_str(msg.to_text()?)?;
     assert!(msg.filepath.ends_with("LIVE"));
-    assert_eq!(msg.toc, false);
-    assert_eq!(msg.suppress_bibliography, false);
+    assert!(!msg.toc);
+    assert!(!msg.suppress_bibliography);
     assert_eq!(msg.toc_title, None);
     assert_eq!(msg.reference_section_title, "");
     assert_eq!(msg.bibid, None);
@@ -299,8 +299,8 @@ async fn python_basic() -> Result<()> {
     };
     let msg: PyNewContentMessage = serde_json::from_str(msg.to_text()?)?;
     assert!(msg.filepath.ends_with("LIVE"));
-    assert_eq!(msg.toc, false);
-    assert_eq!(msg.suppress_bibliography, false);
+    assert!(!msg.toc);
+    assert!(!msg.suppress_bibliography);
     assert_eq!(msg.toc_title, None);
     assert_eq!(msg.reference_section_title, "");
     assert_eq!(msg.bibid, None);

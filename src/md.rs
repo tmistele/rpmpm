@@ -92,7 +92,7 @@ async fn md2json(md: &Bytes, cwd: &Path) -> Result<String> {
     let mut child = cmd.spawn()?;
     let mut stdin = child.stdin.take().expect("stdin take failed");
 
-    stdin.write_all(&md).await?;
+    stdin.write_all(md).await?;
 
     // Send EOF to child
     drop(stdin);
@@ -101,7 +101,7 @@ async fn md2json(md: &Bytes, cwd: &Path) -> Result<String> {
     Ok(String::from_utf8(out.stdout)?)
 }
 
-fn get_citeblocks(block: &serde_json::Value, list: &mut Vec<serde_json::Value>) -> () {
+fn get_citeblocks(block: &serde_json::Value, list: &mut Vec<serde_json::Value>) {
     match block {
         serde_json::Value::Object(map) => {
             if let Some(ty) = map.get("t") {
@@ -154,7 +154,7 @@ async fn json2htmlblock(
     let mut stdin = child.stdin.take().expect("stdin take failed");
 
     let doc = PandocDoc {
-        pandoc_api_version: pandoc_api_version,
+        pandoc_api_version,
         blocks: vec![block],
         meta: serde_json::Map::new(),
     };
@@ -206,13 +206,13 @@ async fn json2htmlblock(
 
     Ok(Htmlblock {
         html: out,
-        citeblocks: citeblocks,
-        hash: hash,
+        citeblocks,
+        hash,
     })
 }
 
 #[cached(result = true, size = 8192, key = "u64", convert = "{hash}")]
-async fn json2titleblock(json: &Vec<u8>, hash: u64, cwd: &Path) -> Result<Option<Htmlblock>> {
+async fn json2titleblock(json: &[u8], hash: u64, cwd: &Path) -> Result<Option<Htmlblock>> {
     let mut cmd = Command::new("pandoc");
     cmd.current_dir(cwd)
         .arg("--from")
@@ -246,14 +246,14 @@ async fn json2titleblock(json: &Vec<u8>, hash: u64, cwd: &Path) -> Result<Option
         Ok(Some(Htmlblock {
             html: out,
             citeblocks: vec![],
-            hash: hash,
+            hash,
         }))
     } else {
         Ok(None)
     }
 }
 
-const BIBKEYS: &'static [&'static str] = &[
+const BIBKEYS: &[&str] = &[
     "bibliography",
     "csl",
     "link-citations",
@@ -271,7 +271,7 @@ fn mtime_from_meta_bibliography(
             .modified()?
             .duration_since(std::time::SystemTime::UNIX_EPOCH)?
             .as_secs();
-        return Ok(mtime);
+        Ok(mtime)
     } else {
         Err(anyhow!("Unexpected json structure in bibliography"))
     }
@@ -279,14 +279,13 @@ fn mtime_from_meta_bibliography(
 
 async fn uniqueciteprocdict(
     doc: &PandocDoc<'_>,
-    htmlblocks: &Vec<Htmlblock>,
+    htmlblocks: &[Htmlblock],
     cwd: &Path,
 ) -> Result<Option<Vec<u8>>> {
     // collect all cite blocks
     let citeblocks = htmlblocks
         .iter()
-        .map(|b| &b.citeblocks)
-        .flatten()
+        .flat_map(|b| &b.citeblocks)
         .collect::<Vec<&serde_json::Value>>();
 
     let mut doc = PandocDocNonRawBlocks {
@@ -300,7 +299,7 @@ async fn uniqueciteprocdict(
     };
 
     // No bib
-    if doc.meta.len() <= 0 {
+    if doc.meta.is_empty() {
         return Ok(None);
     }
 
@@ -331,7 +330,7 @@ async fn uniqueciteprocdict(
 
     // .csl mtime
     if let Some(serde_json::Value::Object(csl)) = doc.meta.get_mut("csl") {
-        let mtime = mtime_from_meta_bibliography(&csl, cwd)?;
+        let mtime = mtime_from_meta_bibliography(csl, cwd)?;
         csl.insert("csl_mtime_".to_string(), serde_json::json!(mtime));
     }
 
@@ -379,10 +378,7 @@ async fn citeproc(
         "".to_string()
     };
 
-    let message = NewCiteprocMessage {
-        bibid: bibid,
-        html: &out,
-    };
+    let message = NewCiteprocMessage { bibid, html: &out };
 
     let jsonmessage = serde_json::to_string(&message)?;
     Ok(jsonmessage)
@@ -402,7 +398,7 @@ struct NewContentMessage<'a> {
     reference_section_title: &'a str,
 }
 
-const TITLEKEYS: &'static [&'static str] = &["title", "subtitle", "author", "date"];
+const TITLEKEYS: &[&str] = &["title", "subtitle", "author", "date"];
 
 // no cache, checks for bib differences
 pub async fn md2htmlblocks<'a>(
@@ -479,7 +475,7 @@ pub async fn md2htmlblocks<'a>(
             .to_str()
             .context("could not convert filepath to str")?, // TODO: relative to cwd?
         htmlblocks: &htmlblocks,
-        bibid: bibid,
+        bibid,
         suppress_bibliography: doc.get_meta_flag("suppress-bibliography"),
         toc: doc.get_meta_flag("toc"),
         toc_title: doc.get_meta_str("toc-title"),
