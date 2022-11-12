@@ -1,5 +1,7 @@
 use anyhow::{Context, Result};
 
+use std::os::unix::ffi::OsStrExt;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use tracing::{debug, trace};
@@ -312,3 +314,224 @@ async fn python_basic() -> Result<()> {
     Ok(())
 }
 
+async fn generate_md_list_item(out: &mut Vec<u8>, i: usize) -> Result<()> {
+    out.write_all(b"- line ").await?;
+    out.write_all(i.to_string().as_bytes()).await?;
+    out.write_all(b" asdf bsdf csdf dsdf").await?;
+    if i % 5 == 0 {
+        out.write_all(b" $\\frac12 = x$").await?;
+    }
+    if (i + 2) % 5 == 0 {
+        out.write_all(b" @John2020").await?;
+    }
+    if (i + 3) % 10 == 0 {
+        out.write_all(b" @Wayne1998").await?;
+    }
+
+    out.write_all(b" esdf\n").await?;
+
+    if i % 20 == 0 {
+        out.write_all(b"\n  $$\\int_0^1 x dx = \\frac12$$\n\n")
+            .await?;
+    }
+
+    Ok(())
+}
+
+async fn generate_long_md() -> Result<Vec<u8>> {
+    let size = 153 * 1024;
+    let large_block_size = 45 * 1024;
+    let small_block_size = 1024;
+
+    let bibfile =
+        PathBuf::from(std::env::var("CARGO_MANIFEST_DIR")?).join("resources/tests/my.bib");
+
+    let mut out = Vec::with_capacity(size);
+    out.write_all(b"---\n").await?;
+    out.write_all(b"bibliography: ").await?;
+    out.write_all(bibfile.into_os_string().as_bytes()).await?;
+    out.write_all(b"\n").await?;
+    out.write_all(b"toc: true\n").await?;
+    out.write_all(b"reference-section-title: References\n")
+        .await?;
+    out.write_all(b"link-citations: true\n").await?;
+    out.write_all(b"---\n\n").await?;
+
+    // Add counter to each line to guarantee no same blocks to avoid caching
+    let mut i = 0;
+
+    out.write_all(b"# Huge block title\n\n").await?;
+    out.write_all(b"- first line of huge block\n").await?;
+    while out.len() < large_block_size {
+        i += 1;
+        generate_md_list_item(&mut out, i).await?;
+    }
+
+    out.write_all(b"\n# Multiple small blocks\n").await?;
+
+    while out.len() < size {
+        out.write_all(b"\n## Small block title ").await?;
+        i += 1;
+        out.write_all(i.to_string().as_bytes()).await?;
+        out.write_all(b"\n\n").await?;
+
+        let prev_size = out.len();
+        while out.len() < small_block_size + prev_size {
+            i += 1;
+            generate_md_list_item(&mut out, i).await?;
+        }
+    }
+
+    Ok(out)
+}
+
+async fn do_naivebench(
+    md: &mut Vec<u8>,
+    pipe: &mut tokio::fs::File,
+    ts: &mut TestServer,
+    label: &str,
+) -> Result<()> {
+    let _start = std::time::Instant::now();
+    TestServer::md_to_pipe_with0(pipe, md).await;
+    let msg = loop {
+        let msg = ts.ws_stream.next().await.context("no websocket msg")??;
+
+        // 1 x change something
+        if !msg.to_text()?.starts_with("{\"status") {
+            break msg;
+        }
+    };
+    debug!(
+        "Time from pipe send to websocket recv for {}: {:?}",
+        label,
+        _start.elapsed()
+    );
+
+    let msg: NewContentMessage = serde_json::from_str(msg.to_text()?)?;
+    trace!("# blocks: {}", msg.htmlblocks.len());
+    trace!("- block[0].len: {}", msg.htmlblocks[0].html.len());
+    trace!("- block[1].len: {}", msg.htmlblocks[1].html.len());
+    trace!("- block[2].len: {}", msg.htmlblocks[2].html.len());
+
+    // Ignore citeproc message
+    let msg = ts.ws_stream.next().await.context("no websocket msg")??;
+    assert!(msg.to_text()?.starts_with("{\"html"));
+
+    // tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn naivebench() -> Result<()> {
+    let mut md = generate_long_md().await?;
+    let mut ts = TestServer::new(true).await?;
+    let mut pipe = ts.open_pipe().await;
+
+    // 1 x cold cache, 2 x warm cache
+    do_naivebench(&mut md, &mut pipe, &mut ts, "initial").await?;
+    do_naivebench(&mut md, &mut pipe, &mut ts, "hot").await?;
+    do_naivebench(&mut md, &mut pipe, &mut ts, "hot").await?;
+
+    // 1 x change something in a small block
+    // 1 x change something in a large block
+    let mut smallblock_changed_md = std::str::from_utf8(&md)?
+        .replacen("# Huge block title", "# huge block title", 1)
+        .as_bytes()
+        .to_vec();
+    let mut largeblock_changed_md = std::str::from_utf8(&md)?
+        .replacen("first line of huge block", "First line of huge block", 1)
+        .as_bytes()
+        .to_vec();
+
+    do_naivebench(
+        &mut smallblock_changed_md,
+        &mut pipe,
+        &mut ts,
+        "small block changed",
+    )
+    .await?;
+    do_naivebench(&mut md, &mut pipe, &mut ts, "previous hot").await?;
+    do_naivebench(
+        &mut largeblock_changed_md,
+        &mut pipe,
+        &mut ts,
+        "large block changed",
+    )
+    .await?;
+
+    Ok(())
+}
+
+async fn do_pythonbench(
+    md: &mut Vec<u8>,
+    pipe: &mut tokio::fs::File,
+    ts: &mut TestServer,
+    label: &str,
+) -> Result<()> {
+    let _start = std::time::Instant::now();
+    TestServer::md_to_pipe_with0(pipe, md).await;
+    let msg = loop {
+        let msg = ts.ws_stream.next().await.context("no websocket msg")??;
+        if !msg.to_text()?.starts_with("{\"status") {
+            break msg;
+        }
+    };
+    debug!(
+        "Time from pipe send to websocket recv for {}: {:?}",
+        label,
+        _start.elapsed()
+    );
+
+    let msg: PyNewContentMessage = serde_json::from_str(msg.to_text()?)?;
+    trace!("# blocks: {}", msg.htmlblocks.len());
+
+    // Ignore citeproc message
+    let msg = ts.ws_stream.next().await.context("no websocket msg")??;
+    assert!(msg.to_text()?.starts_with("{\"html"));
+
+    // tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn pythonbench() -> Result<()> {
+    let mut md = generate_long_md().await?;
+    let mut ts = TestServer::new_python().await?;
+    let mut pipe = ts.open_pipe().await;
+
+    // 1 x cold cache, 2 x warm cache
+    do_pythonbench(&mut md, &mut pipe, &mut ts, "initial").await?;
+    do_pythonbench(&mut md, &mut pipe, &mut ts, "hot").await?;
+    do_pythonbench(&mut md, &mut pipe, &mut ts, "hot").await?;
+
+    // 1 x change something in a small block
+    // 1 x change something in a large block
+    let mut smallblock_changed_md = std::str::from_utf8(&md)?
+        .replacen("# Huge block title", "# huge block title", 1)
+        .as_bytes()
+        .to_vec();
+    let mut largeblock_changed_md = std::str::from_utf8(&md)?
+        .replacen("first line of huge block", "First line of huge block", 1)
+        .as_bytes()
+        .to_vec();
+
+    do_pythonbench(
+        &mut smallblock_changed_md,
+        &mut pipe,
+        &mut ts,
+        "small block changed",
+    )
+    .await?;
+    do_pythonbench(&mut md, &mut pipe, &mut ts, "previous hot").await?;
+    do_pythonbench(
+        &mut largeblock_changed_md,
+        &mut pipe,
+        &mut ts,
+        "large block changed",
+    )
+    .await?;
+
+    Ok(())
+}
