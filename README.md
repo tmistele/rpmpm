@@ -26,12 +26,12 @@ Running
 gives
 
 ```
-Time from pipe send to websocket recv for initial: 1.951543619s
-Time from pipe send to websocket recv for hot: 115.613647ms
-Time from pipe send to websocket recv for hot: 477.013466ms
-Time from pipe send to websocket recv for small block changed: 1.262383539s
-Time from pipe send to websocket recv for previous hot: 484.208431ms
-Time from pipe send to websocket recv for large block changed: 1.425725076s
+Time from pipe send to websocket recv for initial: 1.83306244s
+Time from pipe send to websocket recv for hot: 53.338903ms
+Time from pipe send to websocket recv for hot: 425.407875ms
+Time from pipe send to websocket recv for small block changed: 1.227729877s
+Time from pipe send to websocket recv for previous hot: 427.112575ms
+Time from pipe send to websocket recv for large block changed: 1.429425791s
 ```
 
 I used python 3.10.
