@@ -7,6 +7,8 @@ use crate::md_cmark::md2htmlblocks;
 
 use tracing::{trace, warn};
 
+use indoc::printdoc;
+
 use std::collections::HashMap;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::os::unix::fs::FileTypeExt;
@@ -343,10 +345,7 @@ async fn monitorpipe(
         file
     } else {
         trace!("Opening pipe from path");
-        match tokio::fs::File::open(&pipe).await {
-            Ok(file) => file,
-            Err(e) => return Err(anyhow!(e)),
-        }
+        tokio::fs::File::open(&pipe).await?
     };
 
     loop {
@@ -424,26 +423,23 @@ fn print_client_autodiscovery(
     let pipe_path_str = pipe_path
         .to_str()
         .context("could not convert pipe path to str")?;
-    println!(
-        "pmpm-websocket started (port {})\n\
-              \n\
-              Pipe new content to {}, for example\n\
-                  echo '# Hello World!' > {}\n\
-              \n\
-              Direct your browser to\n\
-                  file://{}?secret={}{}\n\
-              to view the rendered markdown",
-        port,
-        pipe_path_str,
-        pipe_path_str,
-        client_path_str,
-        secret,
-        if port == 9877 {
+    printdoc! {
+        "
+        pmpm-websocket started (port {port})
+
+        Pipe new content to {pipe_path_str}, for example,
+            echo '# Hello World!' > {pipe_path_str}
+
+        Direct your browser to
+            file://{client_path_str}?secret={secret}{port_param}
+        to view the rendered markdown
+        ",
+        port_param = if port == 9877 {
             "".to_string()
         } else {
             format!("&port={}", port)
         }
-    );
+    };
 
     Ok(())
 }
