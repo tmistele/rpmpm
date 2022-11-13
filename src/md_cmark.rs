@@ -138,19 +138,6 @@ async fn md2mdblocks(md: &str) -> Result<SplitMarkdown> {
 
     let parser = pulldown_cmark::Parser::new_ext(md, options);
 
-    // TODO: Pandoc incompatibilty? Two footnote definitions without hard break
-    //
-    // Works in pandoc but not pulldown-cmark
-    //
-    // [^1]: asdf
-    // [^4]: bsdf
-    //
-    // Works in both
-    //
-    // [^1]: asdf
-    //
-    // [^4]: bsdf
-
     // Extract reference definitions, i.e. things like [foo]: http://www.example.com/
     // TODO: can I do w/o clone + to_owned() here?
     let link_reference_definitions: std::collections::HashMap<_, _> = parser
@@ -169,6 +156,9 @@ async fn md2mdblocks(md: &str) -> Result<SplitMarkdown> {
 
     let mut level = 0;
     let mut skip_until = 0;
+    let mut in_footnote_definition = false;
+    let mut current_footnote_definition_start = 0;
+    let mut current_footnote_definition_label = pulldown_cmark::CowStr::Borrowed("");
     for (event, range) in parser.into_offset_iter() {
         // Maybe skip yaml metadata block we have parsed ourselves.
         if range.start < skip_until {
@@ -176,11 +166,19 @@ async fn md2mdblocks(md: &str) -> Result<SplitMarkdown> {
         }
 
         match event {
-            pulldown_cmark::Event::Start(pulldown_cmark::Tag::FootnoteDefinition(_)) => {
+            pulldown_cmark::Event::Start(pulldown_cmark::Tag::FootnoteDefinition(label)) => {
+                in_footnote_definition = true;
+                current_footnote_definition_start = range.start;
+                current_footnote_definition_label = label;
                 level += 1;
             }
-            pulldown_cmark::Event::End(pulldown_cmark::Tag::FootnoteDefinition(ref label)) => {
-                footnote_definitions.insert(label.clone(), range);
+            pulldown_cmark::Event::End(pulldown_cmark::Tag::FootnoteDefinition(_)) => {
+                footnote_definitions.insert(
+                    current_footnote_definition_label,
+                    current_footnote_definition_start..range.end,
+                );
+                current_footnote_definition_label = pulldown_cmark::CowStr::Borrowed("");
+                in_footnote_definition = false;
                 level -= 1;
             }
 
@@ -220,9 +218,26 @@ async fn md2mdblocks(md: &str) -> Result<SplitMarkdown> {
                 }
             }
 
-            pulldown_cmark::Event::FootnoteReference(ref label) => {
-                // TODO: Can this happen inside another footnote? I don't think so??
-                current_block_footnote_references.push(label.clone());
+            pulldown_cmark::Event::FootnoteReference(label) => {
+                if in_footnote_definition {
+                    // Pandoc compatibility: pandoc allows footnote definitions separated by \n, pulldown-cmark needs \n\n.
+                    // So for pulldown-cmark, something like this
+                    // [^1]: Footnote 1
+                    // [^2]: Footnote 2
+                    // looks like a single footnote definition for ^1 that references footnote ^2. But for us it should be
+                    // two footnote definitions.
+                    // Pandoc does not allow one footnote referencing another one, so this won't accidentally introduce a
+                    // different compatibility issue here.
+                    footnote_definitions.insert(
+                        current_footnote_definition_label,
+                        current_footnote_definition_start..range.start - 1,
+                    );
+                    current_footnote_definition_start = range.start;
+                    current_footnote_definition_label = label;
+                } else {
+                    // Normal footnote reference
+                    current_block_footnote_references.push(label.clone());
+                }
             }
 
             pulldown_cmark::Event::Rule if level == 0 => {
@@ -292,7 +307,7 @@ async fn md2mdblocks(md: &str) -> Result<SplitMarkdown> {
                     .map(|label| {
                         footnote_definitions
                             .get(label)
-                            .map_or(0, |range| range.end - range.start)
+                            .map_or(0, |range| range.end - range.start + 2)
                     })
                     .sum::<usize>();
 
@@ -310,7 +325,13 @@ async fn md2mdblocks(md: &str) -> Result<SplitMarkdown> {
             for label in &block.footnote_references {
                 // don't just unwrap in case of missing definition (common while typing!)
                 if let Some(range) = footnote_definitions.get(label) {
-                    write!(buf, "{}", &md[range.start..range.end])?;
+                    let def = &md[range.start..range.end];
+                    write!(buf, "{}", def)?;
+                    if !def.ends_with('\n') {
+                        write!(buf, "\n\n")?;
+                    } else if !def.ends_with("\n\n") {
+                        writeln!(buf)?;
+                    }
                 }
             }
 
@@ -837,15 +858,13 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore] // TODO: Stop ignoring once fix is implemented
     async fn split_md_footnote_defs_without_blank_line() -> Result<()> {
         let (md, _) = read_file("footnote-defs-without-blank-line.md")?;
         let md = std::str::from_utf8(&md)?;
         let split = md2mdblocks(md).await?;
-        // TODO: Fix this
         assert_eq!(split.blocks.len(), 2);
-        assert_eq!(split.blocks[0], "Hi [^1]\n\n[^1]: footnote 1\n");
-        assert_eq!(split.blocks[1], "Ho [^2]\n\n[^2]: footnote 2\n");
+        assert_eq!(split.blocks[0], "Hi [^1]\n\n[^1]: footnote 1\n\n");
+        assert_eq!(split.blocks[1], "Ho [^2]\n\n[^2]: footnote 2\n\n");
         Ok(())
     }
 
