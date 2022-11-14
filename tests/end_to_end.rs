@@ -223,7 +223,7 @@ impl TestServer {
         while written <= md.len() {
             match pipe.write(&md[written..]).await {
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                    trace!("GOT WouldBlock {} after {} bytes", e, written);
+                    debug!("sleeping 10ms because of WouldBlock {} after {} bytes", e, written);
                     tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
 
                     // TODO: I don't understand this. But this seems to give the correct results?!
