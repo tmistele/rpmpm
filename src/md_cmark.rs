@@ -131,8 +131,6 @@ async fn md2mdblocks(md: &str) -> Result<SplitMarkdown> {
         (None, md)
     };
 
-    // TODO: Can there be nested FootenoteDefinitions? I don't think so
-
     let mut options = pulldown_cmark::Options::empty();
     options.insert(pulldown_cmark::Options::ENABLE_FOOTNOTES);
 
@@ -208,6 +206,14 @@ async fn md2mdblocks(md: &str) -> Result<SplitMarkdown> {
                 }
 
                 if level == 0 {
+                    // Don't skip over whitespace at beginning of block
+                    // Important for indented code blocks
+                    // https://pandoc.org/MANUAL.html#indented-code-blocks
+                    let range = md[..range.start]
+                        .rfind('\n')
+                        .map(|index| index + 1..range.end)
+                        .unwrap_or(range);
+
                     blocks.push(ParsedBlock {
                         footnote_references: current_block_footnote_references,
                         link_references: current_block_link_references,
@@ -854,6 +860,21 @@ mod tests {
         //       So we can probably get away with a simple rule like "continue list as
         //       long as the following level-0 tags or standalone blocks are indented".
         assert_eq!(split.blocks.len(), 4);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn split_md_indented_codeblock() -> Result<()> {
+        let (md, _) = read_file("indented-codeblock.md")?;
+        let md = std::str::from_utf8(&md)?;
+        let split = md2mdblocks(md).await?;
+        assert_eq!(split.blocks.len(), 3);
+        assert_eq!(split.blocks[0], "Hi\n\n");
+        assert_eq!(
+            split.blocks[1],
+            "    if (a > 3) {\n        moveShip(5 * gravity, DOWN);\n    }\n\n"
+        );
+        assert_eq!(split.blocks[2], "Ho\n\n");
         Ok(())
     }
 
