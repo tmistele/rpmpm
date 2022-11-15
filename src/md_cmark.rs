@@ -95,6 +95,86 @@ fn try_parse_yaml_metadata_block(md: &str, start: usize) -> Option<(usize, Metad
     Some((end + 1, yaml))
 }
 
+fn scan_multiline_footnote(md: &str, end: usize) -> usize {
+    // Find first non-whitespace non-newline
+    let mut indent = 0;
+    let mut pos = end;
+    for (i, c) in md[end..].bytes().enumerate() {
+        if c == b'\n' {
+            indent = 0;
+        } else if c == b' ' {
+            indent += 1;
+        } else {
+            pos += i;
+            break;
+        }
+    }
+
+    // If not indented, footnote doesn't continue
+    // Trying it out: 4 spaces are needed in pandoc?
+    if indent < 4 {
+        return end;
+    }
+
+    // This indented line belongs to the footnote definition
+    pos += if let Some(line) = md[pos..].find('\n') {
+        line
+    } else {
+        return md.len();
+    };
+
+    // Scan until first unindented/underindented line after a purely whitespace line
+    let mut prev_line_blank = false;
+    loop {
+        // At position `pos`, we have a \n. Ignore it.
+        if md.len() > pos {
+            pos += 1;
+        } else {
+            break;
+        }
+
+        // Scan the line, checking if it is blank or unindented/underindented
+        let mut nl = None;
+        let mut blank = true;
+        let mut indent = 0;
+        for (i, c) in md[pos..].bytes().enumerate() {
+            if c == b'\n' {
+                nl = Some(i);
+                break;
+            } else if c == b' ' {
+                if blank {
+                    indent += 1;
+                }
+            } else {
+                blank = false;
+            }
+        }
+
+        if blank {
+            // Blank lines are ok
+            prev_line_blank = true;
+        } else {
+            // Non-blank lines must be correctly indented, unless the previous line was not blank
+            if indent < 4 && prev_line_blank {
+                // The current line does no longer belong to the footnote
+                break;
+            }
+            prev_line_blank = false;
+        }
+
+        if let Some(nl) = nl {
+            // Go to next \n
+            pos += nl;
+        } else {
+            // We reached EOF (didn't find another \n)
+            pos += md[pos..].len();
+            break;
+        }
+    }
+
+    pos
+}
+
 #[cached(
     result = true,
     size = 10,
@@ -158,7 +238,7 @@ async fn md2mdblocks(md: &str) -> Result<SplitMarkdown> {
     let mut current_footnote_definition_start = 0;
     let mut current_footnote_definition_label = pulldown_cmark::CowStr::Borrowed("");
     for (event, range) in parser.into_offset_iter() {
-        // Maybe skip yaml metadata block we have parsed ourselves.
+        // Maybe skip yaml metadata block or multiline footnote definition we have parsed ourselves.
         if range.start < skip_until {
             continue;
         }
@@ -171,9 +251,13 @@ async fn md2mdblocks(md: &str) -> Result<SplitMarkdown> {
                 level += 1;
             }
             pulldown_cmark::Event::End(pulldown_cmark::Tag::FootnoteDefinition(_)) => {
+                // Pandoc supports multiline footnote definitions, pulldown-cmark doesn't.
+                let end = scan_multiline_footnote(md, range.end);
+                skip_until = end;
+
                 footnote_definitions.insert(
                     current_footnote_definition_label,
-                    current_footnote_definition_start..range.end,
+                    current_footnote_definition_start..end,
                 );
                 current_footnote_definition_label = pulldown_cmark::CowStr::Borrowed("");
                 in_footnote_definition = false;
@@ -823,6 +907,56 @@ mod tests {
                 \n\
                 [^4]: footnote with $x\\\\y=1$ math and stuff $\\frac12 = x$");
         assert_eq!(split.metadata.len(), 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn split_md_footnote_multiline_def() -> Result<()> {
+        let (md, _) = read_file("footnote-defs-multiline.md")?;
+        let md = std::str::from_utf8(&md)?;
+        let split = md2mdblocks(md).await?;
+        assert_eq!(split.blocks.len(), 4);
+        assert_eq!(
+            split.blocks[0],
+            indoc::indoc! {"
+            Here is a footnote reference,[^1] and another.[^longnote]
+
+            [^1]: Here is the footnote.
+
+            [^longnote]: Here's one with multiple blocks.
+
+                Subsequent paragraphs are indented to show that they
+            belong to the previous footnote.
+
+                    { some.code }
+
+                The whole paragraph can be indented, or just the first
+                line.  In this way, multi-paragraph footnotes work like
+                multi-paragraph list items.
+
+            "}
+        );
+        assert_eq!(
+            split.blocks[1],
+            "This paragraph won't be part of the note, because it\nisn't indented.\n\n"
+        );
+        assert_eq!(
+            split.blocks[2],
+            indoc::indoc! {"
+            This is the next test [^2] and [^secondlongnote]
+
+            [^2]: Another small footnote
+
+            [^secondlongnote]: Followed without blank line
+
+                by multiline note
+
+            "}
+        );
+        assert_eq!(
+            split.blocks[3],
+            "and another paragraph that doesn't belong to the footnote.\n\n"
+        );
         Ok(())
     }
 
