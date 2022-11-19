@@ -90,7 +90,7 @@ async fn md2json(md: &Bytes, cwd: &Path) -> Result<String> {
     cmd.stdin(std::process::Stdio::piped());
 
     let mut child = cmd.spawn()?;
-    let mut stdin = child.stdin.take().expect("stdin take failed");
+    let mut stdin = child.stdin.take().context("stdin take failed")?;
 
     stdin.write_all(md).await?;
 
@@ -151,7 +151,7 @@ async fn json2htmlblock(
     cmd.stdin(std::process::Stdio::piped());
 
     let mut child = cmd.spawn()?;
-    let mut stdin = child.stdin.take().expect("stdin take failed");
+    let mut stdin = child.stdin.take().context("stdin take failed")?;
 
     let doc = PandocDoc {
         pandoc_api_version,
@@ -226,7 +226,7 @@ async fn json2titleblock(json: &[u8], hash: u64, cwd: &Path) -> Result<Option<Ht
     cmd.stdin(std::process::Stdio::piped());
 
     let mut child = cmd.spawn()?;
-    let mut stdin = child.stdin.take().expect("stdin take failed");
+    let mut stdin = child.stdin.take().context("stdin take failed")?;
 
     stdin.write_all(json).await?;
 
@@ -365,7 +365,7 @@ async fn citeproc(
         cmd.stdin(std::process::Stdio::piped());
 
         let mut child = cmd.spawn()?;
-        let mut stdin = child.stdin.take().expect("stdin take failed");
+        let mut stdin = child.stdin.take().context("stdin take failed")?;
 
         stdin.write_all(&citeproc_input).await?;
 

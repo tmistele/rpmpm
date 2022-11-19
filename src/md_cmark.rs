@@ -44,7 +44,7 @@ async fn mdblock2htmlblock(md_block: &str, hash: u64, cwd: &Path) -> Result<Html
     cmd.stdin(std::process::Stdio::piped());
 
     let mut child = cmd.spawn()?;
-    let mut stdin = child.stdin.take().expect("stdin take failed");
+    let mut stdin = child.stdin.take().context("stdin take failed")?;
 
     stdin.write_all(md_block.as_bytes()).await?;
 
@@ -123,7 +123,7 @@ async fn titleblock2htmlblock(
     cmd.stdin(std::process::Stdio::piped());
 
     let mut child = cmd.spawn()?;
-    let mut stdin = child.stdin.take().expect("stdin take failed");
+    let mut stdin = child.stdin.take().context("stdin take failed")?;
 
     stdin.write_all(titleblock).await?;
 
@@ -255,7 +255,7 @@ async fn citeproc(
         cmd.stdin(std::process::Stdio::piped());
 
         let mut child = cmd.spawn()?;
-        let mut stdin = child.stdin.take().expect("stdin take failed");
+        let mut stdin = child.stdin.take().context("stdin take failed")?;
 
         stdin.write_all(&citeproc_input).await?;
 
