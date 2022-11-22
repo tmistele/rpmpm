@@ -140,7 +140,7 @@ fn scan_multiline_footnote(
             continuation: Some(ScannedMultilineFootnoteContinuation {
                 unindented_md,
                 space_deletion_points,
-            })
+            }),
         });
     };
 
@@ -229,8 +229,29 @@ fn scan_multiline_footnote(
         continuation: Some(ScannedMultilineFootnoteContinuation {
             unindented_md,
             space_deletion_points,
-        })
+        }),
     })
+}
+
+fn link_reference_label_from_range(md: &str, range: std::ops::Range<usize>) -> Result<&str> {
+    // TODO: ensure last is "]"
+    let mut end = range.end;
+    loop {
+        end = range.start
+            + md[range.start..end]
+                .rfind('[')
+                .context("Missing [ in reference")?;
+        // label can contain ], it just has to be escaped as \]
+        if end == 0 || !&md[end - 1..].starts_with('\\') {
+            break;
+        }
+    }
+    Ok(&md[end + 1..range.end - 1])
+}
+
+struct ParsedFootnote<'input> {
+    range: std::ops::Range<usize>,
+    link_references: Vec<&'input str>,
 }
 
 struct Splitter<'input> {
@@ -243,7 +264,7 @@ struct Splitter<'input> {
     current_block_footnote_references: Vec<CowStr<'input>>,
     current_block_link_references: Vec<&'input str>,
     level: i32,
-    footnote_definitions: std::collections::HashMap<CowStr<'input>, std::ops::Range<usize>>,
+    footnote_definitions: std::collections::HashMap<CowStr<'input>, ParsedFootnote<'input>>,
 }
 
 impl<'input> Splitter<'input> {
@@ -313,9 +334,16 @@ impl<'input> Splitter<'input> {
         range: std::ops::Range<usize>,
     ) -> Result<usize> {
         // First handle the normal non-multiline stuff
+        let mut link_references = Vec::new();
         let mut start = range.start;
         while let Some((event, range)) = self.offset_iter.next() {
             match event {
+                Event::End(Tag::Link(pulldown_cmark::LinkType::Reference, _, _))
+                | Event::End(Tag::Link(pulldown_cmark::LinkType::Shortcut, _, _)) => {
+                    let label = link_reference_label_from_range(self.md, range)?;
+                    link_references.push(label);
+                }
+
                 Event::FootnoteReference(ref_label) => {
                     // Pandoc compatibility: pandoc allows footnote definitions separated by \n, pulldown-cmark needs \n\n.
                     // So for pulldown-cmark, something like this
@@ -327,7 +355,10 @@ impl<'input> Splitter<'input> {
                     // different compatibility issue here.
                     self.footnote_definitions.insert(
                         std::mem::replace(&mut label, ref_label),
-                        start..range.start - 1,
+                        ParsedFootnote {
+                            range: start..range.start - 1,
+                            link_references: std::mem::replace(&mut link_references, Vec::new()),
+                        },
                     );
                     start = range.start;
                 }
@@ -345,10 +376,22 @@ impl<'input> Splitter<'input> {
 
         if multiline_fn.continuation.is_none() {
             // Just a single-line footnote
-            self.footnote_definitions.insert(label, range);
+            self.footnote_definitions.insert(
+                label,
+                ParsedFootnote {
+                    range,
+                    link_references,
+                },
+            );
         } else {
             // It's a multiline footnote
-            self.footnote_multiline_continuation(&multiline_fn, range, None, label)?;
+            self.footnote_multiline_continuation(
+                &multiline_fn,
+                range,
+                None,
+                label,
+                link_references,
+            )?;
         }
 
         self.level -= 1;
@@ -362,6 +405,7 @@ impl<'input> Splitter<'input> {
         range_firstline: std::ops::Range<usize>,
         range_outer: Option<&std::ops::Range<usize>>,
         label: CowStr<'input>,
+        mut link_references: Vec<&'input str>,
     ) -> Result<()> {
         let continuation = multiline_fn.continuation.as_ref().unwrap();
         let cont_md = &continuation.unindented_md;
@@ -427,7 +471,9 @@ impl<'input> Splitter<'input> {
         // and [^inner]. The same whole block will be pasted twice at the end (in `self.finalize()`).
         // But it seems this is fine for pandoc, so it's also fine for us.
 
+        let mut in_nested_footnote = false;
         let mut nested_label = CowStr::Borrowed("");
+        let mut nested_link_references = Vec::new();
 
         let mut skip_until = 0;
         let mut fake_offset_iter = parser.into_offset_iter();
@@ -438,11 +484,21 @@ impl<'input> Splitter<'input> {
             }
 
             match cont_event {
-
                 // TODO: pandoc allows an indented yaml metadata block inside multiline footnote. Handle + skip it!
+                Event::End(Tag::Link(pulldown_cmark::LinkType::Reference, _, _))
+                | Event::End(Tag::Link(pulldown_cmark::LinkType::Shortcut, _, _))
+                | Event::End(Tag::Link(pulldown_cmark::LinkType::ShortcutUnknown, _, _)) => {
+                    let label = link_reference_label_from_range(self.md, range_orig)?;
+                    if in_nested_footnote {
+                        nested_link_references.push(label);
+                    } else {
+                        link_references.push(label);
+                    }
+                }
 
                 Event::Start(Tag::FootnoteDefinition(label)) => {
                     self.level += 1;
+                    in_nested_footnote = true;
 
                     // We need `nested_label` to reference `self.md` not `cont_md`
                     let label_pos = range_orig.start
@@ -455,6 +511,7 @@ impl<'input> Splitter<'input> {
 
                 // TODO: Add test for this FootnoteReference thing in nested multiline ...
                 Event::FootnoteReference(ref_label) => {
+                    in_nested_footnote = true;
                     // We need `ref_label` to reference `self.md` not `cont_md`
                     let ref_label_pos = range_orig.start
                         + self.md[range_orig.start..range_orig.end]
@@ -467,8 +524,16 @@ impl<'input> Splitter<'input> {
                     // See comment in `scan_and_parse_footnote` for more details
                     self.footnote_definitions.insert(
                         std::mem::replace(&mut nested_label, CowStr::Borrowed(ref_label)),
-                        range_outer
-                            .map_or_else(|| range_firstline.start..multiline_fn.end, |ro| ro.clone()),
+                        ParsedFootnote {
+                            range: range_outer.map_or_else(
+                                || range_firstline.start..multiline_fn.end,
+                                |ro| ro.clone(),
+                            ),
+                            link_references: std::mem::replace(
+                                &mut nested_link_references,
+                                Vec::new(),
+                            ),
+                        },
                     );
                 }
 
@@ -486,7 +551,14 @@ impl<'input> Splitter<'input> {
                         // Just a single-line footnote
                         self.footnote_definitions.insert(
                             std::mem::replace(&mut nested_label, CowStr::Borrowed("")),
-                            range_outer.map_or_else(|| immediate_parent_range, |ro| ro.clone()),
+                            ParsedFootnote {
+                                range: range_outer
+                                    .map_or_else(|| immediate_parent_range, |ro| ro.clone()),
+                                link_references: std::mem::replace(
+                                    &mut nested_link_references,
+                                    Vec::new(),
+                                ),
+                            },
                         );
                     } else {
                         // It's a multiline footnote
@@ -495,11 +567,13 @@ impl<'input> Splitter<'input> {
                             range_orig,
                             range_outer.or_else(|| Some(&immediate_parent_range)),
                             std::mem::replace(&mut nested_label, CowStr::Borrowed("")),
+                            std::mem::replace(&mut nested_link_references, Vec::new()),
                         )?;
                     }
 
                     self.level -= 1;
                     skip_until = nested_multiline_fn.end;
+                    in_nested_footnote = false;
                 }
 
                 _ => {}
@@ -508,7 +582,11 @@ impl<'input> Splitter<'input> {
 
         self.footnote_definitions.insert(
             label,
-            range_outer.map_or_else(|| range_firstline.start..multiline_fn.end, |ro| ro.clone()),
+            ParsedFootnote {
+                range: range_outer
+                    .map_or_else(|| range_firstline.start..multiline_fn.end, |ro| ro.clone()),
+                link_references,
+            },
         );
 
         Ok(())
@@ -531,19 +609,7 @@ impl<'input> Splitter<'input> {
                 if let Tag::Link(pulldown_cmark::LinkType::Reference, _, _)
                 | Tag::Link(pulldown_cmark::LinkType::Shortcut, _, _) = tag
                 {
-                    // TODO: ensure last is "]"
-                    let mut end = range.end;
-                    loop {
-                        end = range.start
-                            + md[range.start..end]
-                                .rfind('[')
-                                .context("Missing [ in reference")?;
-                        // label can contain ], it just has to be escaped as \]
-                        if end == 0 || !&md[end - 1..].starts_with('\\') {
-                            break;
-                        }
-                    }
-                    let label = &md[end + 1..range.end - 1];
+                    let label = link_reference_label_from_range(self.md, range.clone())?;
                     self.current_block_link_references.push(label);
                 }
 
@@ -644,9 +710,19 @@ impl<'input> Splitter<'input> {
                         .footnote_references
                         .iter()
                         .map(|label| {
-                            self.footnote_definitions
-                                .get(label)
-                                .map_or(0, |range| range.end - range.start + 2)
+                            self.footnote_definitions.get(label).map_or(0, |fnt| {
+                                fnt.link_references
+                                    .iter()
+                                    .map(|label| {
+                                        self.link_reference_definitions
+                                            .get(*label)
+                                            .map_or(0, |range| range.end - range.start + 1)
+                                    })
+                                    .sum::<usize>()
+                                    + fnt.range.end
+                                    - fnt.range.start
+                                    + 2
+                            })
                         })
                         .sum::<usize>();
 
@@ -663,13 +739,22 @@ impl<'input> Splitter<'input> {
                 // add footnotes
                 for label in &block.footnote_references {
                     // don't just unwrap in case of missing definition (common while typing!)
-                    if let Some(range) = self.footnote_definitions.get(label) {
-                        let def = &self.md[range.start..range.end];
+                    if let Some(fnt) = self.footnote_definitions.get(label) {
+                        // footnote definitions
+                        let def = &self.md[fnt.range.start..fnt.range.end];
                         write!(buf, "{}", def)?;
                         if !def.ends_with('\n') {
                             write!(buf, "\n\n")?;
                         } else if !def.ends_with("\n\n") {
                             writeln!(buf)?;
+                        }
+
+                        // footnote link references
+                        for label in &fnt.link_references {
+                            // don't just unwrap in case of missing definition (common while typing!)
+                            if let Some(range) = self.link_reference_definitions.get(*label) {
+                                writeln!(buf, "{}", &self.md[range.start..range.end])?;
+                            }
                         }
                     }
                 }
@@ -869,6 +954,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn footnote_with_links() -> Result<()> {
+        let (md, _) = read_file("links-in-footnote.md")?;
+        let md = std::str::from_utf8(&md)?;
+        let split = md2mdblocks(md).await?;
+
+        assert_eq!(split.blocks.len(), 2);
+        assert_eq!(
+            split.blocks[0],
+            indoc::indoc! {"
+            Footnote 1[^1]
+
+            [^1]: [link]
+
+            [link]: https://github.com
+            "}
+        );
+        assert_eq!(
+            split.blocks[1],
+            indoc::indoc! {"
+            Footnote 2[^2]
+
+            [^2]: Link in multiline footnote
+
+                works as well [link], right?
+
+            [link]: https://github.com
+            "}
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn footnote_nested_multiline_and_link_refs() -> Result<()> {
         let (md, _) = read_file("footnote-with-link-references-nested-footnote-defs.md")?;
         let md = std::str::from_utf8(&md)?;
@@ -884,9 +1001,10 @@ mod tests {
 
             [^1]: Here another footnote using the [gh] link
 
+            [gh]: https://github.com/
             [^longnote]: Here another one
 
-                that uses the [gh] link only in a multiline continuation.
+                that uses the link only in a multiline continuation.
 
                 [^nested]: And then we get another footnote
 
@@ -899,7 +1017,7 @@ mod tests {
                     longnested cont
                 longnested cont2
 
-                    longnested cont3
+                    longnested cont3 with link [gh]
 
                 back to longnote2
 
@@ -912,7 +1030,7 @@ mod tests {
 
             [^longnote]: Here another one
 
-                that uses the [gh] link only in a multiline continuation.
+                that uses the link only in a multiline continuation.
 
                 [^nested]: And then we get another footnote
 
@@ -925,10 +1043,11 @@ mod tests {
                     longnested cont
                 longnested cont2
 
-                    longnested cont3
+                    longnested cont3 with link [gh]
 
                 back to longnote2
 
+            [gh]: https://github.com/
             "}
         );
         Ok(())

@@ -6,7 +6,7 @@ Nested ones: [^nested] [^longnested]
 
 [^longnote]: Here another one
 
-    that uses the [gh] link only in a multiline continuation.
+    that uses the link only in a multiline continuation.
 
     [^nested]: And then we get another footnote
 
@@ -19,7 +19,7 @@ Nested ones: [^nested] [^longnested]
         longnested cont
     longnested cont2
 
-        longnested cont3
+        longnested cont3 with link [gh]
 
     back to longnote2
 
