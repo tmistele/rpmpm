@@ -6,8 +6,10 @@ use std::hash::{Hash, Hasher};
 
 use cached::proc_macro::cached;
 
+use pulldown_cmark::{CowStr, Event, Tag};
+
 struct ParsedBlock<'a> {
-    footnote_references: Vec<pulldown_cmark::CowStr<'a>>,
+    footnote_references: Vec<CowStr<'a>>,
     link_references: Vec<&'a str>,
     range: core::ops::Range<usize>,
 }
@@ -80,7 +82,22 @@ fn try_parse_yaml_metadata_block(md: &str, start: usize) -> Option<(usize, Metad
     Some((end + 1, yaml))
 }
 
-fn scan_multiline_footnote(md: &str, end: usize) -> usize {
+struct ScannedMultilineFootnoteContinuation {
+    unindented_md: String,
+    space_deletion_points: Vec<(usize, usize)>,
+}
+
+struct ScannedMultilineFootnote {
+    end: usize,
+    base_indent: usize,
+    continuation: Option<ScannedMultilineFootnoteContinuation>,
+}
+
+fn scan_multiline_footnote(
+    md: &str,
+    end: usize,
+    base_indent: usize,
+) -> Result<ScannedMultilineFootnote> {
     // Find first non-whitespace non-newline
     let mut indent = 0;
     let mut pos = end;
@@ -97,15 +114,34 @@ fn scan_multiline_footnote(md: &str, end: usize) -> usize {
 
     // If not indented, footnote doesn't continue
     // Trying it out: 4 spaces are needed in pandoc?
-    if indent < 4 {
-        return end;
+    if indent < 4 + base_indent {
+        return Ok(ScannedMultilineFootnote {
+            end,
+            base_indent,
+            continuation: None,
+        });
     }
+
+    let mut unindented_md = String::new();
+    let mut space_deletion_points = Vec::new();
 
     // This indented line belongs to the footnote definition
     pos += if let Some(line) = md[pos..].find('\n') {
+        unindented_md.push_str(&md[end + base_indent + 4..pos + line + 1]);
+        space_deletion_points.push((end, base_indent + 4));
         line
     } else {
-        return md.len();
+        let line = md.len();
+        unindented_md.push_str(&md[end + base_indent + 4..pos + line]);
+        space_deletion_points.push((end, base_indent + 4));
+        return Ok(ScannedMultilineFootnote {
+            end: line,
+            base_indent,
+            continuation: Some(ScannedMultilineFootnoteContinuation {
+                unindented_md,
+                space_deletion_points,
+            })
+        });
     };
 
     // Scan until first unindented/underindented line after a purely whitespace line
@@ -140,45 +176,78 @@ fn scan_multiline_footnote(md: &str, end: usize) -> usize {
             prev_line_blank = true;
         } else {
             // Non-blank lines must be correctly indented, unless the previous line was not blank
-            if indent < 4 && prev_line_blank {
-                // The current line does no longer belong to the footnote
-                break;
+            if indent < 4 + base_indent {
+                if indent < base_indent {
+                    // Everything must be indented by at least `base_indent` (even without a preceding blank line)
+                    anyhow::bail!("md is not indented correctly");
+                }
+
+                if prev_line_blank {
+                    // The current line does no longer belong to the footnote
+                    break;
+                }
             }
             prev_line_blank = false;
         }
 
         if let Some(nl) = nl {
+            if blank {
+                // We keep blank lines literally
+                unindented_md.push_str(&md[pos..pos + nl + 1]);
+            } else if indent < 4 + base_indent {
+                space_deletion_points.push((pos, base_indent));
+                unindented_md.push_str(&md[pos + base_indent..pos + nl + 1]);
+            } else {
+                space_deletion_points.push((pos, base_indent + 4));
+                unindented_md.push_str(&md[pos + base_indent + 4..pos + nl + 1]);
+            }
+
             // Go to next \n
             pos += nl;
         } else {
+            let nl = md[pos..].len();
+
+            if blank {
+                unindented_md.push_str(&md[pos..pos + nl]);
+            } else if indent < 4 + base_indent {
+                space_deletion_points.push((pos, base_indent));
+                unindented_md.push_str(&md[pos + base_indent..pos + nl]);
+            } else {
+                space_deletion_points.push((pos, base_indent + 4));
+                unindented_md.push_str(&md[pos + base_indent + 4..pos + nl]);
+            }
+
             // We reached EOF (didn't find another \n)
-            pos += md[pos..].len();
+            pos += nl;
             break;
         }
     }
 
-    pos
+    Ok(ScannedMultilineFootnote {
+        end: pos,
+        base_indent,
+        continuation: Some(ScannedMultilineFootnoteContinuation {
+            unindented_md,
+            space_deletion_points,
+        })
+    })
 }
 
-struct Splitter<'a> {
-    md: &'a str,
-    offset_iter: pulldown_cmark::OffsetIter<'a, 'a>,
+struct Splitter<'input> {
+    md: &'input str,
+    offset_iter: pulldown_cmark::OffsetIter<'input, 'input>,
     titleblock: Option<String>,
     link_reference_definitions: std::collections::HashMap<String, std::ops::Range<usize>>,
     metadata: Option<Metadata>,
-    blocks: Vec<ParsedBlock<'a>>,
-    current_block_footnote_references: Vec<pulldown_cmark::CowStr<'a>>,
-    current_block_link_references: Vec<&'a str>,
+    blocks: Vec<ParsedBlock<'input>>,
+    current_block_footnote_references: Vec<CowStr<'input>>,
+    current_block_link_references: Vec<&'input str>,
     level: i32,
-    footnote_definitions:
-        std::collections::HashMap<pulldown_cmark::CowStr<'a>, std::ops::Range<usize>>,
-    in_footnote_definition: bool,
-    current_footnote_definition_start: usize,
-    current_footnote_definition_label: pulldown_cmark::CowStr<'a>,
+    footnote_definitions: std::collections::HashMap<CowStr<'input>, std::ops::Range<usize>>,
 }
 
-impl<'a> Splitter<'a> {
-    fn new(md: &'a str) -> Self {
+impl<'input> Splitter<'input> {
+    fn new(md: &'input str) -> Self {
         // Parse titleblock
         let (titleblock, md) = if let Some(mut title) = md.strip_prefix('%') {
             let mut end = 0;
@@ -223,9 +292,6 @@ impl<'a> Splitter<'a> {
             current_block_link_references: Vec::new(),
             level: 0,
             footnote_definitions: std::collections::HashMap::new(),
-            in_footnote_definition: false,
-            current_footnote_definition_start: 0,
-            current_footnote_definition_label: pulldown_cmark::CowStr::Borrowed(""),
         }
     }
 
@@ -236,49 +302,234 @@ impl<'a> Splitter<'a> {
             if range.start < skip_until {
                 continue;
             }
-            skip_until = self.step(self.md, event, range)?;
+            skip_until = self.step(event, range)?;
         }
         Ok(())
     }
 
-    fn step(
+    fn scan_and_parse_footnote(
         &mut self,
-        md: &'a str,
-        event: pulldown_cmark::Event<'a>,
+        mut label: CowStr<'input>,
         range: std::ops::Range<usize>,
     ) -> Result<usize> {
+        // First handle the normal non-multiline stuff
+        let mut start = range.start;
+        while let Some((event, range)) = self.offset_iter.next() {
+            match event {
+                Event::FootnoteReference(ref_label) => {
+                    // Pandoc compatibility: pandoc allows footnote definitions separated by \n, pulldown-cmark needs \n\n.
+                    // So for pulldown-cmark, something like this
+                    // [^1]: Footnote 1
+                    // [^2]: Footnote 2
+                    // looks like a single footnote definition for ^1 that references footnote ^2. But for us it should be
+                    // two footnote definitions.
+                    // Pandoc does not allow one footnote referencing another one, so this won't accidentally introduce a
+                    // different compatibility issue here.
+                    self.footnote_definitions.insert(
+                        std::mem::replace(&mut label, ref_label),
+                        start..range.start - 1,
+                    );
+                    start = range.start;
+                }
+
+                Event::End(Tag::FootnoteDefinition(_)) => {
+                    break;
+                }
+                _ => {}
+            }
+        }
+        let range = start..range.end;
+
+        // Find out how long this footnote block actually is
+        let multiline_fn = scan_multiline_footnote(self.md, range.end, 0)?;
+
+        if multiline_fn.continuation.is_none() {
+            // Just a single-line footnote
+            self.footnote_definitions.insert(label, range);
+        } else {
+            // It's a multiline footnote
+            self.footnote_multiline_continuation(&multiline_fn, range, None, label)?;
+        }
+
+        self.level -= 1;
+
+        Ok(multiline_fn.end)
+    }
+
+    fn footnote_multiline_continuation(
+        &mut self,
+        multiline_fn: &ScannedMultilineFootnote,
+        range_firstline: std::ops::Range<usize>,
+        range_outer: Option<&std::ops::Range<usize>>,
+        label: CowStr<'input>,
+    ) -> Result<()> {
+        let continuation = multiline_fn.continuation.as_ref().unwrap();
+        let cont_md = &continuation.unindented_md;
+        let space_deletion_points = &continuation.space_deletion_points;
+
+        // Translates from a range in `cont_md` to a range in the original `self.md`
+        let translate_cont_range_to_orig_md = |cont_range: &std::ops::Range<usize>| {
+            let mut start = range_firstline.end + cont_range.start;
+            let mut end = range_firstline.end + cont_range.end;
+            for (deletion_point, ndel) in space_deletion_points.iter() {
+                if start > *deletion_point {
+                    start += ndel;
+                    end += ndel;
+                } else if end > *deletion_point {
+                    end += ndel;
+                } else {
+                    // Small perf optimization
+                    break;
+                }
+            }
+            start..end
+        };
+
+        let mut options = pulldown_cmark::Options::empty();
+        options.insert(pulldown_cmark::Options::ENABLE_FOOTNOTES);
+
+        let mut broken_link_callback = |_broken: pulldown_cmark::BrokenLink| {
+            // pretend every reference exists.
+            // If that's wrong, nothing bad happens, pandoc will notice later
+            Some((CowStr::Borrowed(""), CowStr::Borrowed("")))
+        };
+        let parser = pulldown_cmark::Parser::new_with_broken_link_callback(
+            &cont_md,
+            options,
+            Some(&mut broken_link_callback),
+        );
+
+        // TODO: new reference_definitions? Is this possible within multiline footnote?
+
+        // For all nested footnotes, we push the *whole* footnote block to `self.footnote_definitions`.
+        // That is, for the footnote [^nested] in this definition
+        //
+        // [^outer]: Outer
+        //
+        //    [^nested]: Inner
+        //
+        //
+        // We push the whole thing to `self.footnote_definitions`, including `[^outer]`.
+        // This is because otherwise, blocks referencing [^nested] see this footnote definition
+        //
+        //     [^nested]
+        //
+        // But without the enclosing [^outer] definition, this is actually an indented code block
+        // for pandoc, so it will not work!
+        //
+        // We could try to unindent the footnote, but then we can no longer just push `Range`s to
+        // `self.footnote_definitions`, which makes things more complicated.
+        //
+        // Just always pushing the outer block is of course not optimal for perf, but I think nested
+        // footnotes are uncommon, so it doesn't matter much.
+        //
+        // Note that this will lead to multiple definitions in blocks that reference both [^outer]
+        // and [^inner]. The same whole block will be pasted twice at the end (in `self.finalize()`).
+        // But it seems this is fine for pandoc, so it's also fine for us.
+
+        let mut nested_label = CowStr::Borrowed("");
+
+        let mut skip_until = 0;
+        let mut fake_offset_iter = parser.into_offset_iter();
+        while let Some((cont_event, cont_range)) = fake_offset_iter.next() {
+            let range_orig = translate_cont_range_to_orig_md(&cont_range);
+            if range_orig.start < skip_until {
+                continue;
+            }
+
+            match cont_event {
+
+                // TODO: pandoc allows an indented yaml metadata block inside multiline footnote. Handle + skip it!
+
+                Event::Start(Tag::FootnoteDefinition(label)) => {
+                    self.level += 1;
+
+                    // We need `nested_label` to reference `self.md` not `cont_md`
+                    let label_pos = range_orig.start
+                        + self.md[range_orig.start..range_orig.end]
+                            .find(label.as_ref())
+                            .context("label not found")?;
+                    let label = &self.md[label_pos..label_pos + label.len()];
+                    nested_label = CowStr::Borrowed(label);
+                }
+
+                // TODO: Add test for this FootnoteReference thing in nested multiline ...
+                Event::FootnoteReference(ref_label) => {
+                    // We need `ref_label` to reference `self.md` not `cont_md`
+                    let ref_label_pos = range_orig.start
+                        + self.md[range_orig.start..range_orig.end]
+                            .find(ref_label.as_ref())
+                            .context("label not found")?;
+                    let ref_label = &self.md[ref_label_pos..ref_label_pos + ref_label.len()];
+
+                    // Pandoc compatibility:
+                    // A `FootnoteReference` inside a footnote is actually a new footnote definition.
+                    // See comment in `scan_and_parse_footnote` for more details
+                    self.footnote_definitions.insert(
+                        std::mem::replace(&mut nested_label, CowStr::Borrowed(ref_label)),
+                        range_outer
+                            .map_or_else(|| range_firstline.start..multiline_fn.end, |ro| ro.clone()),
+                    );
+                }
+
+                Event::End(Tag::FootnoteDefinition(_)) => {
+                    // Find out how long this footnote block actually is
+                    let nested_multiline_fn = scan_multiline_footnote(
+                        self.md,
+                        range_orig.end,
+                        multiline_fn.base_indent + 4,
+                    )?;
+
+                    let immediate_parent_range = range_firstline.start..multiline_fn.end;
+
+                    if nested_multiline_fn.continuation.is_none() {
+                        // Just a single-line footnote
+                        self.footnote_definitions.insert(
+                            std::mem::replace(&mut nested_label, CowStr::Borrowed("")),
+                            range_outer.map_or_else(|| immediate_parent_range, |ro| ro.clone()),
+                        );
+                    } else {
+                        // It's a multiline footnote
+                        self.footnote_multiline_continuation(
+                            &nested_multiline_fn,
+                            range_orig,
+                            range_outer.or_else(|| Some(&immediate_parent_range)),
+                            std::mem::replace(&mut nested_label, CowStr::Borrowed("")),
+                        )?;
+                    }
+
+                    self.level -= 1;
+                    skip_until = nested_multiline_fn.end;
+                }
+
+                _ => {}
+            };
+        }
+
+        self.footnote_definitions.insert(
+            label,
+            range_outer.map_or_else(|| range_firstline.start..multiline_fn.end, |ro| ro.clone()),
+        );
+
+        Ok(())
+    }
+
+    fn step(&mut self, event: Event<'input>, range: std::ops::Range<usize>) -> Result<usize> {
+        let md = self.md;
         let mut skip_until = 0;
         match event {
-            pulldown_cmark::Event::Start(pulldown_cmark::Tag::FootnoteDefinition(label)) => {
-                self.in_footnote_definition = true;
-                self.current_footnote_definition_start = range.start;
-                self.current_footnote_definition_label = label;
+            Event::Start(Tag::FootnoteDefinition(label)) => {
+                self.level += 1;
+                skip_until = self.scan_and_parse_footnote(label, range)?;
+            }
+            Event::Start(_) => {
                 self.level += 1;
             }
-            pulldown_cmark::Event::End(pulldown_cmark::Tag::FootnoteDefinition(_)) => {
-                // Pandoc supports multiline footnote definitions, pulldown-cmark doesn't.
-                let end = scan_multiline_footnote(md, range.end);
-                skip_until = end;
-
-                self.footnote_definitions.insert(
-                    std::mem::replace(
-                        &mut self.current_footnote_definition_label,
-                        pulldown_cmark::CowStr::Borrowed(""),
-                    ),
-                    self.current_footnote_definition_start..end,
-                );
-                self.in_footnote_definition = false;
-                self.level -= 1;
-            }
-
-            pulldown_cmark::Event::Start(_) => {
-                self.level += 1;
-            }
-            pulldown_cmark::Event::End(tag) => {
+            Event::End(tag) => {
                 self.level -= 1;
 
-                if let pulldown_cmark::Tag::Link(pulldown_cmark::LinkType::Reference, _, _)
-                | pulldown_cmark::Tag::Link(pulldown_cmark::LinkType::Shortcut, _, _) = tag
+                if let Tag::Link(pulldown_cmark::LinkType::Reference, _, _)
+                | Tag::Link(pulldown_cmark::LinkType::Shortcut, _, _) = tag
                 {
                     // TODO: ensure last is "]"
                     let mut end = range.end;
@@ -300,9 +551,7 @@ impl<'a> Splitter<'a> {
                     // Don't skip over whitespace at beginning of block
                     // Important for indented code blocks
                     // https://pandoc.org/MANUAL.html#indented-code-blocks
-                    let range = if let pulldown_cmark::Tag::CodeBlock(
-                        pulldown_cmark::CodeBlockKind::Indented,
-                    ) = tag
+                    let range = if let Tag::CodeBlock(pulldown_cmark::CodeBlockKind::Indented) = tag
                     {
                         md[..range.start]
                             .rfind('\n')
@@ -322,28 +571,11 @@ impl<'a> Splitter<'a> {
                 }
             }
 
-            pulldown_cmark::Event::FootnoteReference(label) => {
-                if self.in_footnote_definition {
-                    // Pandoc compatibility: pandoc allows footnote definitions separated by \n, pulldown-cmark needs \n\n.
-                    // So for pulldown-cmark, something like this
-                    // [^1]: Footnote 1
-                    // [^2]: Footnote 2
-                    // looks like a single footnote definition for ^1 that references footnote ^2. But for us it should be
-                    // two footnote definitions.
-                    // Pandoc does not allow one footnote referencing another one, so this won't accidentally introduce a
-                    // different compatibility issue here.
-                    self.footnote_definitions.insert(
-                        std::mem::replace(&mut self.current_footnote_definition_label, label),
-                        self.current_footnote_definition_start..range.start - 1,
-                    );
-                    self.current_footnote_definition_start = range.start;
-                } else {
-                    // Normal footnote reference
-                    self.current_block_footnote_references.push(label.clone());
-                }
+            Event::FootnoteReference(label) => {
+                self.current_block_footnote_references.push(label);
             }
 
-            pulldown_cmark::Event::Rule if self.level == 0 => {
+            Event::Rule if self.level == 0 => {
                 // A Rule may indicate a yaml metadata block
                 if let Some((yaml_end, parsed_yaml)) =
                     try_parse_yaml_metadata_block(md, range.start)
@@ -632,6 +864,72 @@ mod tests {
         assert_eq!(
             split.blocks[3],
             "and another paragraph that doesn't belong to the footnote.\n\n"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn footnote_nested_multiline_and_link_refs() -> Result<()> {
+        let (md, _) = read_file("footnote-with-link-references-nested-footnote-defs.md")?;
+        let md = std::str::from_utf8(&md)?;
+        let split = md2mdblocks(md).await?;
+
+        // Note that nested footnote blocks are always appended to md blocks in full
+        // i.e. not just the parts that are actually needed, see `Splitter::footnote_multiline_continuation`
+        assert_eq!(split.blocks.len(), 2);
+        assert_eq!(
+            split.blocks[0],
+            indoc::indoc! {"
+            Here is a footnote reference,[^1] and another.[^longnote] [^longnote2]
+
+            [^1]: Here another footnote using the [gh] link
+
+            [^longnote]: Here another one
+
+                that uses the [gh] link only in a multiline continuation.
+
+                [^nested]: And then we get another footnote
+
+            [^longnote2]: A second long footnote with nested stuff
+
+                second line
+
+                [^longnested]: longnested??
+
+                    longnested cont
+                longnested cont2
+
+                    longnested cont3
+
+                back to longnote2
+
+            "}
+        );
+        assert_eq!(
+            split.blocks[1],
+            indoc::indoc! {"
+            Nested ones: [^nested] [^longnested]
+
+            [^longnote]: Here another one
+
+                that uses the [gh] link only in a multiline continuation.
+
+                [^nested]: And then we get another footnote
+
+            [^longnote2]: A second long footnote with nested stuff
+
+                second line
+
+                [^longnested]: longnested??
+
+                    longnested cont
+                longnested cont2
+
+                    longnested cont3
+
+                back to longnote2
+
+            "}
         );
         Ok(())
     }
