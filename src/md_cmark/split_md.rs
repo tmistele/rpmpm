@@ -1117,4 +1117,62 @@ mod tests {
         assert_eq!(split.blocks[1], "Ho [^2]\n\n[^2]: footnote 2\n\n");
         Ok(())
     }
+
+    #[tokio::test]
+    async fn scan_multiline_footnote_basic() -> Result<()> {
+        let md = "other\n\n[^1]: asdf";
+        let scanned = scan_multiline_footnote(&md, md.len() - 1, 0)?;
+        assert_eq!(scanned.end, md.len() - 1);
+        assert_eq!(scanned.base_indent, 0);
+        assert!(scanned.continuation.is_none());
+
+        let md = "other\n\n[^1]: asdf\n\n    bsdf\n\ncsdf";
+        let scanned = scan_multiline_footnote(&md, 19, 0)?;
+        assert_eq!(&md[19..scanned.end], "    bsdf\n\n");
+        assert_eq!(scanned.base_indent, 0);
+        assert!(scanned.continuation.is_some());
+        assert_eq!(
+            scanned.continuation.as_ref().unwrap().unindented_md,
+            "bsdf\n\n"
+        );
+        assert_eq!(
+            scanned.continuation.as_ref().unwrap().space_deletion_points,
+            vec![(19, 4)]
+        );
+
+        let md = indoc::indoc! {"
+            other
+
+            [^1]: asdf
+
+                bsdf
+
+                [^nested]: nested1
+                    nested2
+
+                    nested3
+                nested4
+
+                    nested5
+
+                csdf
+        "};
+        let pos = md.find("nested1").unwrap() + 8;
+        let scanned = scan_multiline_footnote(&md, pos, 4)?;
+        assert_eq!(scanned.base_indent, 4);
+        assert_eq!(
+            &md[pos..scanned.end],
+            "        nested2\n\n        nested3\n    nested4\n\n        nested5\n\n"
+        );
+        assert_eq!(
+            scanned.continuation.as_ref().unwrap().space_deletion_points,
+            vec![
+                (pos, 8),
+                (pos + 8 + 9, 8),
+                (pos + 8 + 9 + 8 + 8, 4),
+                (pos + 8 + 9 + 8 + 8 + 4 + 9, 8)
+            ]
+        );
+        Ok(())
+    }
 }
