@@ -20,6 +20,8 @@ Nested ones: [^nested] [^longnested]
     longnested cont2
 
         longnested cont3 with link [gh]
+longnested cont4
+  longnested cont5
 
     back to longnote2
 

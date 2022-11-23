@@ -176,27 +176,20 @@ fn scan_multiline_footnote(
             prev_line_blank = true;
         } else {
             // Non-blank lines must be correctly indented, unless the previous line was not blank
-            if indent < 4 + base_indent {
-                if indent < base_indent {
-                    // Everything must be indented by at least `base_indent` (even without a preceding blank line)
-                    anyhow::bail!("md is not indented correctly");
-                }
-
-                if prev_line_blank {
-                    // The current line does no longer belong to the footnote
-                    break;
-                }
+            if indent < 4 + base_indent && prev_line_blank {
+                // The current line does no longer belong to the footnote
+                break;
             }
             prev_line_blank = false;
         }
 
         if let Some(nl) = nl {
-            if blank {
-                // We keep blank lines literally
+            if blank || indent < 4 + base_indent {
+                // We keep blank + underindented lines literally
+                // Note that underindented lines only happen after non-blank lines where
+                // pandoc does not care about indentation (i.e. indented stuff will not
+                // accidentally become an indented CodeBlock or something like that).
                 unindented_md.push_str(&md[pos..pos + nl + 1]);
-            } else if indent < 4 + base_indent {
-                space_deletion_points.push((pos, base_indent));
-                unindented_md.push_str(&md[pos + base_indent..pos + nl + 1]);
             } else {
                 space_deletion_points.push((pos, base_indent + 4));
                 unindented_md.push_str(&md[pos + base_indent + 4..pos + nl + 1]);
@@ -207,11 +200,8 @@ fn scan_multiline_footnote(
         } else {
             let nl = md[pos..].len();
 
-            if blank {
+            if blank || indent < 4 + base_indent {
                 unindented_md.push_str(&md[pos..pos + nl]);
-            } else if indent < 4 + base_indent {
-                space_deletion_points.push((pos, base_indent));
-                unindented_md.push_str(&md[pos + base_indent..pos + nl]);
             } else {
                 space_deletion_points.push((pos, base_indent + 4));
                 unindented_md.push_str(&md[pos + base_indent + 4..pos + nl]);
@@ -1018,6 +1008,8 @@ mod tests {
                 longnested cont2
 
                     longnested cont3 with link [gh]
+            longnested cont4
+              longnested cont5
 
                 back to longnote2
 
@@ -1044,6 +1036,8 @@ mod tests {
                 longnested cont2
 
                     longnested cont3 with link [gh]
+            longnested cont4
+              longnested cont5
 
                 back to longnote2
 
@@ -1169,9 +1163,12 @@ mod tests {
             vec![
                 (pos, 8),
                 (pos + 8 + 9, 8),
-                (pos + 8 + 9 + 8 + 8, 4),
                 (pos + 8 + 9 + 8 + 8 + 4 + 9, 8)
             ]
+        );
+        assert_eq!(
+            scanned.continuation.as_ref().unwrap().unindented_md,
+            "nested2\n\nnested3\n    nested4\n\nnested5\n\n"
         );
         Ok(())
     }
