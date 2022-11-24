@@ -104,15 +104,7 @@ fn scan_list_continuation(md: &str, last_li_start: usize, end: usize) -> Result<
     let mut symbol_end = 0;
     for (i, c) in md[last_li_start..].bytes().enumerate() {
         match c {
-            b'-' => {
-                symbol_end = i;
-                break;
-            }
-            b'*' => {
-                symbol_end = i;
-                break;
-            }
-            b'+' => {
+            b'-' | b'*' | b'+' => {
                 symbol_end = i;
                 break;
             }
@@ -196,7 +188,7 @@ fn scan_list_continuation(md: &str, last_li_start: usize, end: usize) -> Result<
         } else {
             // Non-blank lines must be correctly indented, unless the previous line was not blank
             if prev_line_blank && indent < required_indent {
-                // The current line does no longer belong to the footnote
+                // The current line does no longer belong to the list
                 break;
             }
             prev_line_blank = false;
