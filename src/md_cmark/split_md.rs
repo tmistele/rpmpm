@@ -82,6 +82,172 @@ fn try_parse_yaml_metadata_block(md: &str, start: usize) -> Option<(usize, Metad
     Some((end + 1, yaml))
 }
 
+struct ScannedListContinuation {
+    unindented_md: String,
+    space_deletion_points: Vec<(usize, usize)>,
+}
+
+struct ScannedListEnd {
+    end: usize,
+    continuation: Option<ScannedListContinuation>,
+}
+
+// TODO: This works only with list symbols supported by pulldown-cmark, i.e. -*+ and 1., 2., etc.
+//       But pandoc also supports a-z, A-Z, roman (i., ii., etc.), ...?
+
+fn scan_list_continuation(md: &str, last_li_start: usize, end: usize) -> Result<ScannedListEnd> {
+    // First find out if the last item was an empty one (blank up to the itemize symbol -*+ or [0-9].)
+    // Also note the indentation + length of item symbol of the last list item for later.
+    // e.g. for a line " -" it's 2, for a line like "10." it's 3. That's the minimum indenation later.
+
+    // Find indent + check for valid list symbol
+    let mut symbol_end = 0;
+    for (i, c) in md[last_li_start..].bytes().enumerate() {
+        match c {
+            b'-' => {
+                symbol_end = i;
+                break;
+            }
+            b'*' => {
+                symbol_end = i;
+                break;
+            }
+            b'+' => {
+                symbol_end = i;
+                break;
+            }
+            b'0'..=b'9' => {
+                symbol_end = i;
+                // no break!
+            }
+            b'.' => {
+                // '.' must come after 0-9
+                if symbol_end > 0 {
+                    symbol_end = i;
+                    break;
+                } else {
+                    anyhow::bail!("Invalid list item");
+                }
+            }
+            b' ' => {
+                // spaces must come before list symbol
+                if symbol_end > 0 {
+                    anyhow::bail!("Invalid list item");
+                }
+            }
+            _ => anyhow::bail!("Invalid list item"),
+        }
+    }
+
+    // We're at end of md / list
+    if symbol_end == md[last_li_start..end].len() - 1 {
+        return Ok(ScannedListEnd {
+            end,
+            continuation: None,
+        });
+    }
+
+    let mut blank_lines_before_loop = 0;
+
+    // Check if it's an empty item
+    for (_, c) in md[last_li_start + symbol_end + 1..end].bytes().enumerate() {
+        if c == b'\n' {
+            blank_lines_before_loop += 1;
+        } else if c != b' ' {
+            // Not an empty item, no need to do anything
+            return Ok(ScannedListEnd {
+                end,
+                continuation: None,
+            });
+        }
+    }
+
+    // Subsequent lines must be indented by at least one more than `symbol_end
+    let required_indent = symbol_end + 1;
+
+    // Check how far the block continues.
+    let mut pos = end;
+    let mut unindented_md = String::new();
+    let mut space_deletion_points = Vec::new();
+
+    // Scan until first unindented/underindented line after a purely whitespace line
+    let mut prev_line_blank = blank_lines_before_loop >= 2;
+    loop {
+        // Scan the line, checking if it is blank or unindented/underindented
+        let mut nl = None;
+        let mut blank = true;
+        let mut indent = 0;
+        for (i, c) in md[pos..].bytes().enumerate() {
+            if c == b'\n' {
+                nl = Some(i);
+                break;
+            } else if c == b' ' {
+                if blank {
+                    indent += 1;
+                }
+            } else {
+                blank = false;
+            }
+        }
+
+        if blank {
+            // Blank lines are ok
+            prev_line_blank = true;
+        } else {
+            // Non-blank lines must be correctly indented, unless the previous line was not blank
+            if prev_line_blank && indent < required_indent {
+                // The current line does no longer belong to the footnote
+                break;
+            }
+            prev_line_blank = false;
+        }
+
+        if let Some(nl) = nl {
+            if blank || indent < required_indent {
+                unindented_md.push_str(&md[pos..pos + nl + 1]);
+            } else {
+                space_deletion_points.push((pos, required_indent));
+                unindented_md.push_str(&md[pos + required_indent..pos + nl + 1]);
+            }
+
+            // Go to next \n
+            pos += nl;
+        } else {
+            let nl = md[pos..].len();
+
+            if blank || indent < required_indent {
+                unindented_md.push_str(&md[pos..pos + nl]);
+            } else {
+                space_deletion_points.push((pos, required_indent));
+                unindented_md.push_str(&md[pos + required_indent..pos + nl]);
+            }
+
+            // We reached EOF (didn't find another \n)
+            pos += nl;
+            break;
+        }
+
+        // At position `pos`, we have a \n. Ignore it.
+        if md.len() > pos {
+            pos += 1;
+        } else {
+            break;
+        }
+    }
+
+    return Ok(ScannedListEnd {
+        end: pos,
+        continuation: if pos > end {
+            Some(ScannedListContinuation {
+                unindented_md,
+                space_deletion_points,
+            })
+        } else {
+            None
+        },
+    });
+}
+
 struct ScannedMultilineFootnoteContinuation {
     unindented_md: String,
     space_deletion_points: Vec<(usize, usize)>,
@@ -251,10 +417,12 @@ struct Splitter<'input> {
     link_reference_definitions: std::collections::HashMap<String, std::ops::Range<usize>>,
     metadata: Option<Metadata>,
     blocks: Vec<ParsedBlock<'input>>,
+    current_block_start: Option<usize>,
     current_block_footnote_references: Vec<CowStr<'input>>,
     current_block_link_references: Vec<&'input str>,
     level: i32,
     footnote_definitions: std::collections::HashMap<CowStr<'input>, ParsedFootnote<'input>>,
+    last_li_start: usize,
 }
 
 impl<'input> Splitter<'input> {
@@ -299,10 +467,12 @@ impl<'input> Splitter<'input> {
             link_reference_definitions,
             metadata: None,
             blocks: Vec::new(), // TODO: capacity? guess from last one?
+            current_block_start: None,
             current_block_footnote_references: Vec::new(),
             current_block_link_references: Vec::new(),
             level: 0,
             footnote_definitions: std::collections::HashMap::new(),
+            last_li_start: 0,
         }
     }
 
@@ -590,7 +760,30 @@ impl<'input> Splitter<'input> {
                 self.level += 1;
                 skip_until = self.scan_and_parse_footnote(label, range)?;
             }
-            Event::Start(_) => {
+            Event::Start(Tag::Item) => {
+                self.level += 1;
+                self.last_li_start = range.start;
+            }
+            Event::Start(tag) => {
+                // Set start of range of current block.
+                // Don't do this if we're in a block that's just being continued (see e.g. list continuation)
+                if self.level == 0 && self.current_block_start.is_none() {
+                    // Don't skip over whitespace at beginning of block
+                    // Important for indented code blocks
+                    // https://pandoc.org/MANUAL.html#indented-code-blocks
+                    let start = if let Tag::CodeBlock(pulldown_cmark::CodeBlockKind::Indented) = tag
+                    {
+                        md[..range.start]
+                            .rfind('\n')
+                            .map(|index| index + 1)
+                            .unwrap_or(range.start)
+                    } else {
+                        range.start
+                    };
+
+                    self.current_block_start = Some(start);
+                }
+
                 self.level += 1;
             }
             Event::End(tag) => {
@@ -604,15 +797,31 @@ impl<'input> Splitter<'input> {
                 }
 
                 if self.level == 0 {
-                    // Don't skip over whitespace at beginning of block
-                    // Important for indented code blocks
-                    // https://pandoc.org/MANUAL.html#indented-code-blocks
-                    let range = if let Tag::CodeBlock(pulldown_cmark::CodeBlockKind::Indented) = tag
-                    {
-                        md[..range.start]
-                            .rfind('\n')
-                            .map(|index| index + 1..range.end)
-                            .unwrap_or(range)
+                    // Pandoc sometimes continues a list when pulldown-cmark starts
+                    // a new block. Detect and handle this.
+                    let range = if let Tag::List(_) = tag {
+                        // TODO: keep track of used links inside the skipped block, something like `self.scan_and_parse_footnote()`
+                        // TODO: nested list continuation?
+                        // TODO: keep track of footnote definitions within nested list (can this actually happen?)
+                        // TODO: yaml metadata block inside?
+                        let scanned_list_end =
+                            scan_list_continuation(self.md, self.last_li_start, range.end)?;
+                        if scanned_list_end.continuation.is_some() {
+                            skip_until = scanned_list_end.end;
+                            if skip_until < md.len() {
+                                // Avoid adding block.
+                                // This continued list will be concatenated together with the next block.
+                                // Note: The next block may or may not be a continuation of the current list.
+                                // So sometimes we make one block out of what should be two blocks.
+                                // This may hurt performance a bit, but it's not a correctness problem!
+                                return Ok(skip_until);
+                            } else {
+                                // If we skip until the end of the block, add the current block (and then skip in the normal way)
+                                range.start..skip_until
+                            }
+                        } else {
+                            range
+                        }
                     } else {
                         range
                     };
@@ -622,7 +831,8 @@ impl<'input> Splitter<'input> {
                             &mut self.current_block_footnote_references,
                         ),
                         link_references: std::mem::take(&mut self.current_block_link_references),
-                        range,
+                        range: self.current_block_start.take().context("no block start")?
+                            ..range.end,
                     });
                 }
             }
@@ -1062,27 +1272,50 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore] // TODO: Stop ignoring once fix is implemented
     async fn list_item_with_gap() -> Result<()> {
         let (md, _) = read_file("list-item-with-gap.md")?;
         let md = std::str::from_utf8(&md)?;
         let split = md2mdblocks(md).await?;
-        // TODO: Fix this
-        //
-        //       Note: Parsing this exactly like pandoc may be a bit tricky (why does
-        //       the third code block terminate the list but not the other two? -> actually it's
-        //       easy -- it's just the blank line! w/o blank line it's fine w/o indentation --
-        //       otherwise must be indented. Same rule with footnote continuation!)
-        //
-        //       BUT: We can just err on the side of concatenating a few too many blocks!
-        //
-        //       Because if we fail to split a few blocks that's at most a perf problem.
-        //       Correctness will not be affected in this case. And the perf problem is
-        //       probably very minor if we only concat a few small blocks.
-        //
-        //       So we can probably get away with a simple rule like "continue list as
-        //       long as the following level-0 tags or standalone blocks are indented".
-        assert_eq!(split.blocks.len(), 4);
+        assert_eq!(split.blocks.len(), 2);
+        assert_eq!(
+            split.blocks[0],
+            indoc::indoc! {"
+                -
+
+                 test
+
+                -
+
+                  ---
+
+                   test2
+
+                   ```julia
+                x = 1
+                ```
+
+                    four-space indented
+
+                   test3
+
+                   ```python
+
+                   y=1
+                   ```
+
+                   test4
+
+                   ```python
+
+                z=1
+                ```
+
+                -
+
+
+            "}
+        );
+        assert_eq!(split.blocks[1], "test3\n\n");
         Ok(())
     }
 
@@ -1160,16 +1393,63 @@ mod tests {
         );
         assert_eq!(
             scanned.continuation.as_ref().unwrap().space_deletion_points,
-            vec![
-                (pos, 8),
-                (pos + 8 + 9, 8),
-                (pos + 8 + 9 + 8 + 8 + 4 + 9, 8)
-            ]
+            vec![(pos, 8), (pos + 8 + 9, 8), (pos + 8 + 9 + 8 + 8 + 4 + 9, 8)]
         );
         assert_eq!(
             scanned.continuation.as_ref().unwrap().unindented_md,
             "nested2\n\nnested3\n    nested4\n\nnested5\n\n"
         );
+        Ok(())
+    }
+
+    fn scan_list_helper(md: &str) -> Result<(usize, ScannedListEnd)> {
+        let mut last_li_start = 0;
+        let (_, range) = pulldown_cmark::Parser::new(&md)
+            .into_offset_iter()
+            .find(|(event, range)| match event {
+                Event::End(Tag::List(_)) => true,
+                Event::End(Tag::Item) => {
+                    last_li_start = range.start;
+                    false
+                }
+                _ => false,
+            })
+            .context("no list end")?;
+        Ok((
+            range.start,
+            scan_list_continuation(&md, last_li_start, range.end)?,
+        ))
+    }
+
+    fn do_scan_list_continuation(md: &str, expected: &str) -> Result<()> {
+        let (list_start, scanned) = scan_list_helper(md)?;
+        assert_eq!(&md[list_start..scanned.end], expected);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn scan_list_continuation_basic() -> Result<()> {
+        do_scan_list_continuation("-\n test", "-\n test")?;
+        do_scan_list_continuation("-\n\n test", "-\n\n test")?;
+        do_scan_list_continuation("-\n  test", "-\n  test")?;
+        do_scan_list_continuation("-\n\n  test", "-\n\n  test")?;
+        do_scan_list_continuation(" -\n test", " -\n test")?;
+        do_scan_list_continuation(" -\n\n test", " -\n\n")?;
+        do_scan_list_continuation(" -\nasdf", " -\nasdf")?;
+        do_scan_list_continuation("- asdf\n -\n\n asdf", "- asdf\n -\n\n")?;
+        do_scan_list_continuation(" - asdf\n- asdf\n -\n\n asdf", " - asdf\n- asdf\n -\n\n")?;
+        do_scan_list_continuation(" - \n\n  asdf", " - \n\n  asdf")?;
+        do_scan_list_continuation(" - \n\n   asdf", " - \n\n   asdf")?;
+        assert!(do_scan_list_continuation("    -\n\n asdf", "").is_err());
+        do_scan_list_continuation("   -\n  asdf\n\n    asdf", "   -\n  asdf\n\n    asdf")?;
+
+        let (_, scanned) = scan_list_helper("-\n test")?;
+        assert_eq!(scanned.continuation.as_ref().unwrap().unindented_md, "test");
+        assert_eq!(
+            scanned.continuation.as_ref().unwrap().space_deletion_points,
+            vec![(2, 1)]
+        );
+
         Ok(())
     }
 }

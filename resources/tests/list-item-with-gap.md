@@ -12,6 +12,8 @@
 x = 1
 ```
 
+    four-space indented
+
    test3
 
    ```python
