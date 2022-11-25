@@ -885,8 +885,12 @@ impl<'input> Splitter<'input> {
             .blocks
             .iter()
             .map(|block| {
-                let length = (block.range.end - block.range.start)
-                    + 1
+
+                let block_md = &self.md[block.range.start..block.range.end];
+                let block_md_has_newln = block_md.ends_with('\n');
+
+                let length = block_md.len()
+                    + if block_md_has_newln { 1 } else { 2 }
                     + block
                         .link_references
                         .iter()
@@ -918,7 +922,11 @@ impl<'input> Splitter<'input> {
 
                 let mut buf = String::with_capacity(length);
                 // block content
-                writeln!(buf, "{}", &self.md[block.range.start..block.range.end])?;
+                if block_md_has_newln {
+                    writeln!(buf, "{}", block_md)?;
+                } else {
+                    writeln!(buf, "{}\n", block_md)?;
+                }
                 // add definitions
                 for label in &block.link_references {
                     // don't just unwrap in case of missing definition (common while typing!)
@@ -1043,7 +1051,7 @@ mod tests {
             Some(&serde_yaml::Value::Bool(true))
         );
         assert_eq!(split_md.blocks.len(), 1);
-        assert_eq!(split_md.blocks[0], "asdf\n");
+        assert_eq!(split_md.blocks[0], "asdf\n\n");
 
         Ok(())
     }
@@ -1057,7 +1065,7 @@ mod tests {
             Some("%asdf1\n asdf2\n asdf3".to_string())
         );
         assert_eq!(split_md.blocks.len(), 1);
-        assert_eq!(split_md.blocks[0], "asdf4\n");
+        assert_eq!(split_md.blocks[0], "asdf4\n\n");
         assert_eq!(split_md.metadata.len(), 0);
 
         let md = "%asdf1\n asdf2";
@@ -1470,6 +1478,16 @@ mod tests {
         let split = md2mdblocks(md).await?;
         assert_eq!(split.blocks.len(), 1);
         assert_eq!(split.blocks[0], "[fOO]\n\n[Foo]: https://github.com/\n");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn no_newline_before_eof() -> Result<()> {
+        let md = "[link]: https://github.com/\nA paragraph with [link]";
+        let split = md2mdblocks(md).await?;
+        assert_eq!(split.blocks.len(), 1);
+        // Important that there are two \n in front of the [link]: definition
+        assert_eq!(split.blocks[0], "A paragraph with [link]\n\n[link]: https://github.com/\n");
         Ok(())
     }
 }
