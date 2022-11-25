@@ -96,6 +96,11 @@ struct ScannedListEnd {
 //       But pandoc also supports a-z, A-Z, roman (i., ii., etc.), ...?
 
 fn scan_list_continuation(md: &str, last_li_start: usize, end: usize) -> Result<ScannedListEnd> {
+
+    // For nested lists, the items don't start at line beginning, but at previous indent level
+    // Could in principle save this `rfind()` by keeping track of indent levels?
+    let last_li_start = md[..last_li_start].rfind('\n').map_or(0, |x| x + 1);
+
     // First find out if the last item was an empty one (blank up to the itemize symbol -*+ or [0-9].)
     // Also note the indentation + length of item symbol of the last list item for later.
     // e.g. for a line " -" it's 2, for a line like "10." it's 3. That's the minimum indenation later.
@@ -1466,6 +1471,13 @@ mod tests {
         assert_eq!(
             scanned.continuation.as_ref().unwrap().space_deletion_points,
             vec![(2, 1)]
+        );
+
+        let (_, scanned) = scan_list_helper("- test\n\n  -\n\n     test2")?;
+        assert_eq!(scanned.continuation.as_ref().unwrap().unindented_md, "  test2");
+        assert_eq!(
+            scanned.continuation.as_ref().unwrap().space_deletion_points,
+            vec![(13, 3)]
         );
 
         Ok(())
