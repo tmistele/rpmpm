@@ -407,7 +407,6 @@ struct Splitter<'input> {
     md: &'input str,
     offset_iter: pulldown_cmark::OffsetIter<'input, 'input>,
     titleblock: Option<String>,
-    link_reference_definitions: std::collections::HashMap<String, std::ops::Range<usize>>,
     metadata: Option<Metadata>,
     blocks: Vec<ParsedBlock<'input>>,
     current_block_start: Option<usize>,
@@ -443,21 +442,12 @@ impl<'input> Splitter<'input> {
         let mut options = pulldown_cmark::Options::empty();
         options.insert(pulldown_cmark::Options::ENABLE_FOOTNOTES);
 
-        let parser = pulldown_cmark::Parser::new_ext(md, options);
-
-        // Extract reference definitions, i.e. things like [foo]: http://www.example.com/
-        // TODO: can I do w/o clone + to_owned() here?
-        let link_reference_definitions: std::collections::HashMap<_, _> = parser
-            .reference_definitions()
-            .iter()
-            .map(|(label, def)| (label.to_owned(), def.span.clone()))
-            .collect();
+        let offset_iter = pulldown_cmark::Parser::new_ext(md, options).into_offset_iter();
 
         Splitter {
             md,
-            offset_iter: parser.into_offset_iter(),
+            offset_iter,
             titleblock,
-            link_reference_definitions,
             metadata: None,
             blocks: Vec::new(), // TODO: capacity? guess from last one?
             current_block_start: None,
@@ -884,6 +874,8 @@ impl<'input> Splitter<'input> {
     }
 
     fn finalize(self) -> Result<SplitMarkdown> {
+        let ref_defs = self.offset_iter.reference_definitions();
+
         let blocks = self
             .blocks
             .iter()
@@ -894,9 +886,9 @@ impl<'input> Splitter<'input> {
                         .link_references
                         .iter()
                         .map(|label| {
-                            self.link_reference_definitions
+                            ref_defs
                                 .get(*label)
-                                .map_or(0, |range| range.end - range.start + 1)
+                                .map_or(0, |def| def.span.end - def.span.start + 1)
                         })
                         .sum::<usize>()
                     + block
@@ -907,9 +899,9 @@ impl<'input> Splitter<'input> {
                                 fnt.link_references
                                     .iter()
                                     .map(|label| {
-                                        self.link_reference_definitions
+                                        ref_defs
                                             .get(*label)
-                                            .map_or(0, |range| range.end - range.start + 1)
+                                            .map_or(0, |def| def.span.end - def.span.start + 1)
                                     })
                                     .sum::<usize>()
                                     + fnt.range.end
@@ -925,8 +917,8 @@ impl<'input> Splitter<'input> {
                 // add definitions
                 for label in &block.link_references {
                     // don't just unwrap in case of missing definition (common while typing!)
-                    if let Some(range) = self.link_reference_definitions.get(*label) {
-                        writeln!(buf, "{}", &self.md[range.start..range.end])?;
+                    if let Some(def) = ref_defs.get(*label) {
+                        writeln!(buf, "{}", &self.md[def.span.start..def.span.end])?;
                     }
                 }
                 // add footnotes
@@ -945,8 +937,8 @@ impl<'input> Splitter<'input> {
                         // footnote link references
                         for label in &fnt.link_references {
                             // don't just unwrap in case of missing definition (common while typing!)
-                            if let Some(range) = self.link_reference_definitions.get(*label) {
-                                writeln!(buf, "{}", &self.md[range.start..range.end])?;
+                            if let Some(def) = ref_defs.get(*label) {
+                                writeln!(buf, "{}", &self.md[def.span.start..def.span.end])?;
                             }
                         }
                     }
@@ -1453,6 +1445,16 @@ mod tests {
             vec![(2, 1)]
         );
 
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn link_reference_upperlowercase() -> Result<()> {
+        let (md, _) = read_file("link-reference-upperlowercase.md")?;
+        let md = std::str::from_utf8(&md)?;
+        let split = md2mdblocks(md).await?;
+        assert_eq!(split.blocks.len(), 1);
+        assert_eq!(split.blocks[0], "[fOO]\n\n[Foo]: https://github.com/\n");
         Ok(())
     }
 }
