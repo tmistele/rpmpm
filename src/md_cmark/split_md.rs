@@ -496,6 +496,9 @@ impl<'input> Splitter<'input> {
                     // two footnote definitions.
                     // Pandoc does not allow one footnote referencing another one, so this won't accidentally introduce a
                     // different compatibility issue here.
+                    //
+                    // Can be removed (also in self.footnote_multiline_continuation) when this is fixed?
+                    // https://github.com/raphlinus/pulldown-cmark/issues/618
                     self.footnote_definitions.insert(
                         std::mem::replace(&mut label, ref_label),
                         ParsedFootnote {
