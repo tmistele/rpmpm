@@ -409,12 +409,8 @@ struct Splitter<'input> {
     titleblock: Option<String>,
     metadata: Option<Metadata>,
     blocks: Vec<ParsedBlock<'input>>,
-    current_block_start: Option<usize>,
-    current_block_footnote_references: Vec<CowStr<'input>>,
-    current_block_link_references: Vec<&'input str>,
     level: i32,
     footnote_definitions: std::collections::HashMap<CowStr<'input>, ParsedFootnote<'input>>,
-    last_li_start: usize,
 }
 
 impl<'input> Splitter<'input> {
@@ -450,36 +446,168 @@ impl<'input> Splitter<'input> {
             titleblock,
             metadata: None,
             blocks: Vec::new(), // TODO: capacity? guess from last one?
-            current_block_start: None,
-            current_block_footnote_references: Vec::new(),
-            current_block_link_references: Vec::new(),
             level: 0,
             footnote_definitions: std::collections::HashMap::new(),
-            last_li_start: 0,
         }
     }
 
     fn split(&mut self) -> Result<()> {
+        let md = self.md;
+
+        let mut last_li_start = 0;
+        let mut current_block_start = None;
+        let mut current_block_footnote_references = Vec::new();
+        let mut current_block_link_references = Vec::new();
+
         let mut skip_until = 0;
         while let Some((event, range)) = self.offset_iter.next() {
             // Skip e.g. yaml metadata block we parsed ourselves
             if range.start < skip_until {
                 continue;
             }
-            skip_until = self.step(event, range)?;
+
+            match event {
+                Event::Start(Tag::FootnoteDefinition(label)) => {
+                    self.level += 1;
+                    skip_until = self.scan_and_parse_footnote(label, range)?;
+                }
+                Event::Start(Tag::Item) => {
+                    self.level += 1;
+                    last_li_start = range.start;
+                }
+                Event::Start(tag) => {
+                    // Set start of range of current block.
+                    // Don't do this if we're in a block that's just being continued (see e.g. list continuation)
+                    if self.level == 0 && current_block_start.is_none() {
+                        // Don't skip over whitespace at beginning of block
+                        // Important for indented code blocks
+                        // https://pandoc.org/MANUAL.html#indented-code-blocks
+                        let start =
+                            if let Tag::CodeBlock(pulldown_cmark::CodeBlockKind::Indented) = tag {
+                                md[..range.start]
+                                    .rfind('\n')
+                                    .map(|index| index + 1)
+                                    .unwrap_or(range.start)
+                            } else {
+                                range.start
+                            };
+
+                        current_block_start = Some(start);
+                    }
+
+                    self.level += 1;
+                }
+                Event::End(tag) => {
+                    self.level -= 1;
+
+                    if let Tag::Link(pulldown_cmark::LinkType::Reference, _, _)
+                    | Tag::Link(pulldown_cmark::LinkType::Shortcut, _, _) = tag
+                    {
+                        let label = link_reference_label_from_range(self.md, range.clone())?;
+                        current_block_link_references.push(label);
+                    }
+
+                    if self.level == 0 {
+                        // Pandoc sometimes continues a list when pulldown-cmark starts
+                        // a new block. Detect and handle this.
+                        let range = if let Tag::List(_) = tag {
+                            // TODO: keep track of used links inside the skipped block, something like `self.scan_and_parse_footnote()`
+                            // TODO: nested list continuation?
+                            // TODO: keep track of footnote definitions within nested list (can this actually happen?)
+                            // TODO: yaml metadata block inside?
+                            let scanned_list_end =
+                                scan_list_continuation(self.md, last_li_start, range.end)?;
+                            if scanned_list_end.continuation.is_some() {
+                                // Do not add the would-be-ending list as a block.
+                                // This continued list will be concatenated together with the next block.
+                                //
+                                // Note: The next block may or may not be a continuation of the current list.
+                                // So sometimes we make one block out of what should be two blocks.
+                                // This may hurt performance a bit, but it's not a correctness problem!
+                                //
+                                // Note also: If skip_until lies beyond the last block, it can happen that this
+                                // block is never added here. That's why we add any remaining "dangling" below
+                                // after the loop over events.
+                                skip_until = scanned_list_end.end;
+                                continue;
+                            } else {
+                                range
+                            }
+                        } else {
+                            range
+                        };
+
+                        self.blocks.push(ParsedBlock {
+                            footnote_references: std::mem::take(
+                                &mut current_block_footnote_references,
+                            ),
+                            link_references: std::mem::take(&mut current_block_link_references),
+                            range: current_block_start.take().context("no block start")?..range.end,
+                        });
+                    }
+                }
+
+                Event::FootnoteReference(label) => {
+                    current_block_footnote_references.push(label);
+                }
+
+                Event::Rule if self.level == 0 => {
+                    // A Rule may indicate a yaml metadata block
+                    if let Some((yaml_end, parsed_yaml)) =
+                        try_parse_yaml_metadata_block(md, range.start)
+                    {
+                        if let Some(ref mut metadata) = self.metadata {
+                            // A second/third/... metadata block. Merge it into the existing one
+                            for (key, value) in parsed_yaml.into_iter() {
+                                metadata.insert(key, value);
+                            }
+                        } else {
+                            // First metadata block, use it directly
+                            self.metadata = Some(parsed_yaml);
+                        }
+                        skip_until = yaml_end;
+                    } else {
+                        // A top-level Rule
+                        self.blocks.push(ParsedBlock {
+                            footnote_references: Vec::new(),
+                            link_references: Vec::new(),
+                            range,
+                        });
+                    }
+                }
+
+                _ => {
+                    if self.level == 0 {
+                        // A single-event top-level block, e.g. a Rule
+                        // TODO: can this happen actually? Rule is handled separately now...
+                        self.blocks.push(ParsedBlock {
+                            footnote_references: Vec::new(),
+                            link_references: Vec::new(),
+                            range,
+                        });
+                    }
+                }
+            }
         }
 
         // Add any remaining "dangling" blocks, see list continuation
-        if let Some(start) = self.current_block_start {
+        if let Some(start) = current_block_start {
             self.blocks.push(ParsedBlock {
-                footnote_references: std::mem::take(
-                    &mut self.current_block_footnote_references,
-                ),
-                link_references: std::mem::take(&mut self.current_block_link_references),
+                footnote_references: std::mem::take(&mut current_block_footnote_references),
+                link_references: std::mem::take(&mut current_block_link_references),
                 // I think "daling" blocks happen only when skip_until is set to the end of the block
-                range: start..skip_until
+                range: start..skip_until,
             });
         }
+
+        // TODO: save source locations, at least at block-level? -- maybe we can use these to
+        //       implement "jump to block" in editor?
+
+        // TODO: pmpm right now = references to same footnote in different blocks = footnote appears
+        //       twice. Here, we maybe can improve on this since we anyway parse the thing?
+
+        // TODO: referencing footnotes in `title: ...` does not work (also doesn't work in normal pmpm)
+
         Ok(())
     }
 
@@ -748,144 +876,6 @@ impl<'input> Splitter<'input> {
         );
 
         Ok(())
-    }
-
-    fn step(&mut self, event: Event<'input>, range: std::ops::Range<usize>) -> Result<usize> {
-        let md = self.md;
-        let mut skip_until = 0;
-        match event {
-            Event::Start(Tag::FootnoteDefinition(label)) => {
-                self.level += 1;
-                skip_until = self.scan_and_parse_footnote(label, range)?;
-            }
-            Event::Start(Tag::Item) => {
-                self.level += 1;
-                self.last_li_start = range.start;
-            }
-            Event::Start(tag) => {
-                // Set start of range of current block.
-                // Don't do this if we're in a block that's just being continued (see e.g. list continuation)
-                if self.level == 0 && self.current_block_start.is_none() {
-                    // Don't skip over whitespace at beginning of block
-                    // Important for indented code blocks
-                    // https://pandoc.org/MANUAL.html#indented-code-blocks
-                    let start = if let Tag::CodeBlock(pulldown_cmark::CodeBlockKind::Indented) = tag
-                    {
-                        md[..range.start]
-                            .rfind('\n')
-                            .map(|index| index + 1)
-                            .unwrap_or(range.start)
-                    } else {
-                        range.start
-                    };
-
-                    self.current_block_start = Some(start);
-                }
-
-                self.level += 1;
-            }
-            Event::End(tag) => {
-                self.level -= 1;
-
-                if let Tag::Link(pulldown_cmark::LinkType::Reference, _, _)
-                | Tag::Link(pulldown_cmark::LinkType::Shortcut, _, _) = tag
-                {
-                    let label = link_reference_label_from_range(self.md, range.clone())?;
-                    self.current_block_link_references.push(label);
-                }
-
-                if self.level == 0 {
-                    // Pandoc sometimes continues a list when pulldown-cmark starts
-                    // a new block. Detect and handle this.
-                    let range = if let Tag::List(_) = tag {
-                        // TODO: keep track of used links inside the skipped block, something like `self.scan_and_parse_footnote()`
-                        // TODO: nested list continuation?
-                        // TODO: keep track of footnote definitions within nested list (can this actually happen?)
-                        // TODO: yaml metadata block inside?
-                        let scanned_list_end =
-                            scan_list_continuation(self.md, self.last_li_start, range.end)?;
-                        if scanned_list_end.continuation.is_some() {
-                            skip_until = scanned_list_end.end;
-                            // Do not add the would-be-ending list as a block.
-                            // This continued list will be concatenated together with the next block.
-                            //
-                            // Note: The next block may or may not be a continuation of the current list.
-                            // So sometimes we make one block out of what should be two blocks.
-                            // This may hurt performance a bit, but it's not a correctness problem!
-                            //
-                            // Note also: If skip_until lies beyond the last block, it can happen that this
-                            // block is never added here in `step()`. That's why we add any remaining "dangling"
-                            // block in `self.split()` at the very end.
-                            return Ok(skip_until);
-                        } else {
-                            range
-                        }
-                    } else {
-                        range
-                    };
-
-                    self.blocks.push(ParsedBlock {
-                        footnote_references: std::mem::take(
-                            &mut self.current_block_footnote_references,
-                        ),
-                        link_references: std::mem::take(&mut self.current_block_link_references),
-                        range: self.current_block_start.take().context("no block start")?
-                            ..range.end,
-                    });
-                }
-            }
-
-            Event::FootnoteReference(label) => {
-                self.current_block_footnote_references.push(label);
-            }
-
-            Event::Rule if self.level == 0 => {
-                // A Rule may indicate a yaml metadata block
-                if let Some((yaml_end, parsed_yaml)) =
-                    try_parse_yaml_metadata_block(md, range.start)
-                {
-                    if let Some(ref mut metadata) = self.metadata {
-                        // A second/third/... metadata block. Merge it into the existing one
-                        for (key, value) in parsed_yaml.into_iter() {
-                            metadata.insert(key, value);
-                        }
-                    } else {
-                        // First metadata block, use it directly
-                        self.metadata = Some(parsed_yaml);
-                    }
-                    skip_until = yaml_end;
-                } else {
-                    // A top-level Rule
-                    self.blocks.push(ParsedBlock {
-                        footnote_references: Vec::new(),
-                        link_references: Vec::new(),
-                        range,
-                    });
-                }
-            }
-
-            _ => {
-                if self.level == 0 {
-                    // A single-event top-level block, e.g. a Rule
-                    // TODO: can this happen actually? Rule is handled separately now...
-                    self.blocks.push(ParsedBlock {
-                        footnote_references: Vec::new(),
-                        link_references: Vec::new(),
-                        range,
-                    });
-                }
-            }
-        }
-
-        // TODO: save source locations, at least at block-level? -- maybe we can use these to
-        //       implement "jump to block" in editor?
-
-        // TODO: pmpm right now = references to same footnote in different blocks = footnote appears
-        //       twice. Here, we maybe can improve on this since we anyway parse the thing?
-
-        // TODO: referencing footnotes in `title: ...` does not work (also doesn't work in normal pmpm)
-
-        Ok(skip_until)
     }
 
     fn finalize(self) -> Result<SplitMarkdown> {
