@@ -468,6 +468,18 @@ impl<'input> Splitter<'input> {
             }
             skip_until = self.step(event, range)?;
         }
+
+        // Add any remaining "dangling" blocks, see list continuation
+        if let Some(start) = self.current_block_start {
+            self.blocks.push(ParsedBlock {
+                footnote_references: std::mem::take(
+                    &mut self.current_block_footnote_references,
+                ),
+                link_references: std::mem::take(&mut self.current_block_link_references),
+                // I think "daling" blocks happen only when skip_until is set to the end of the block
+                range: start..skip_until
+            });
+        }
         Ok(())
     }
 
@@ -794,17 +806,17 @@ impl<'input> Splitter<'input> {
                             scan_list_continuation(self.md, self.last_li_start, range.end)?;
                         if scanned_list_end.continuation.is_some() {
                             skip_until = scanned_list_end.end;
-                            if skip_until < md.len() {
-                                // Avoid adding block.
-                                // This continued list will be concatenated together with the next block.
-                                // Note: The next block may or may not be a continuation of the current list.
-                                // So sometimes we make one block out of what should be two blocks.
-                                // This may hurt performance a bit, but it's not a correctness problem!
-                                return Ok(skip_until);
-                            } else {
-                                // If we skip until the end of the block, add the current block (and then skip in the normal way)
-                                range.start..skip_until
-                            }
+                            // Do not add the would-be-ending list as a block.
+                            // This continued list will be concatenated together with the next block.
+                            //
+                            // Note: The next block may or may not be a continuation of the current list.
+                            // So sometimes we make one block out of what should be two blocks.
+                            // This may hurt performance a bit, but it's not a correctness problem!
+                            //
+                            // Note also: If skip_until lies beyond the last block, it can happen that this
+                            // block is never added here in `step()`. That's why we add any remaining "dangling"
+                            // block in `self.split()` at the very end.
+                            return Ok(skip_until);
                         } else {
                             range
                         }
@@ -1304,6 +1316,16 @@ mod tests {
             "}
         );
         assert_eq!(split.blocks[1], "test3\n\n");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn list_item_with_gap_at_end_with_refdef() -> Result<()> {
+        let (md, _) = read_file("list-item-with-gap-at-end-with-refdef.md")?;
+        let md = std::str::from_utf8(&md)?;
+        let split = md2mdblocks(md).await?;
+        assert_eq!(split.blocks.len(), 1);
+        assert_eq!(split.blocks[0], "-\n\n test\n\n\n");
         Ok(())
     }
 
