@@ -101,21 +101,21 @@ fn scan_list_continuation(md: &str, last_li_start: usize, end: usize) -> Result<
     // e.g. for a line " -" it's 2, for a line like "10." it's 3. That's the minimum indenation later.
 
     // Find indent + check for valid list symbol
-    let mut symbol_end = 0;
+    let mut symbol_end = None;
     for (i, c) in md[last_li_start..].bytes().enumerate() {
         match c {
             b'-' | b'*' | b'+' => {
-                symbol_end = i;
+                symbol_end = Some(i);
                 break;
             }
             b'0'..=b'9' => {
-                symbol_end = i;
+                symbol_end = Some(i);
                 // no break!
             }
-            b'.' => {
-                // '.' must come after 0-9
-                if symbol_end > 0 {
-                    symbol_end = i;
+            b'.' | b')' => {
+                // '.' or ')' must come after 0-9
+                if symbol_end.is_some() {
+                    symbol_end = Some(i);
                     break;
                 } else {
                     anyhow::bail!("Invalid list item");
@@ -123,13 +123,14 @@ fn scan_list_continuation(md: &str, last_li_start: usize, end: usize) -> Result<
             }
             b' ' => {
                 // spaces must come before list symbol
-                if symbol_end > 0 {
+                if symbol_end.is_some() {
                     anyhow::bail!("Invalid list item");
                 }
             }
             _ => anyhow::bail!("Invalid list item"),
         }
     }
+    let symbol_end = symbol_end.context("no list symbol found")?;
 
     // We're at end of md / list
     if symbol_end == md[last_li_start..end].len() - 1 {
@@ -1434,6 +1435,16 @@ mod tests {
         do_scan_list_continuation(" - \n\n   asdf", " - \n\n   asdf")?;
         assert!(do_scan_list_continuation("    -\n\n asdf", "").is_err());
         do_scan_list_continuation("   -\n  asdf\n\n    asdf", "   -\n  asdf\n\n    asdf")?;
+
+        do_scan_list_continuation("*\n test", "*\n test")?;
+        do_scan_list_continuation("+\n test", "+\n test")?;
+        do_scan_list_continuation("1.\n test", "1.\n test")?;
+        do_scan_list_continuation("1)\n test", "1)\n test")?;
+        do_scan_list_continuation("10.\n test", "10.\n test")?;
+        do_scan_list_continuation("10)\n test", "10)\n test")?;
+        do_scan_list_continuation("10.\n\n test", "10.\n\n")?;
+        do_scan_list_continuation("10.\n\n  test", "10.\n\n")?;
+        do_scan_list_continuation("10.\n\n   test", "10.\n\n   test")?;
 
         let (_, scanned) = scan_list_helper("-\n test")?;
         assert_eq!(scanned.continuation.as_ref().unwrap().unindented_md, "test");
