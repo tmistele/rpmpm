@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 
-use std::collections::hash_map::DefaultHasher;
+use std::collections::{hash_map::DefaultHasher, HashMap};
 use std::fmt::Write as _;
 use std::hash::{Hash, Hasher};
 
@@ -8,13 +8,15 @@ use cached::proc_macro::cached;
 
 use pulldown_cmark::{CowStr, Event, Tag};
 
+use unicase::UniCase;
+
 struct ParsedBlock<'a> {
     footnote_references: Vec<CowStr<'a>>,
     link_references: Vec<&'a str>,
     range: core::ops::Range<usize>,
 }
 
-type Metadata = std::collections::HashMap<String, serde_yaml::Value>;
+type Metadata = HashMap<String, serde_yaml::Value>;
 
 #[derive(Clone)]
 pub struct SplitMarkdown {
@@ -96,7 +98,6 @@ struct ScannedListEnd {
 //       But pandoc also supports a-z, A-Z, roman (i., ii., etc.), ...?
 
 fn scan_list_continuation(md: &str, last_li_start: usize, end: usize) -> Result<ScannedListEnd> {
-
     // For nested lists, the items don't start at line beginning, but at previous indent level
     // Could in principle save this `rfind()` by keeping track of indent levels?
     let last_li_start = md[..last_li_start].rfind('\n').map_or(0, |x| x + 1);
@@ -233,7 +234,7 @@ fn scan_list_continuation(md: &str, last_li_start: usize, end: usize) -> Result<
         }
     }
 
-    return Ok(ScannedListEnd {
+    Ok(ScannedListEnd {
         end: pos,
         continuation: if pos > end {
             Some(ScannedListContinuation {
@@ -243,7 +244,7 @@ fn scan_list_continuation(md: &str, last_li_start: usize, end: usize) -> Result<
         } else {
             None
         },
-    });
+    })
 }
 
 struct ScannedMultilineFootnoteContinuation {
@@ -257,11 +258,21 @@ struct ScannedMultilineFootnote {
     continuation: Option<ScannedMultilineFootnoteContinuation>,
 }
 
+fn find_footnote_indent(md: &str, start: usize) -> Result<usize> {
+    let line_start = md[..start].rfind('\n').map_or(0, |x| x + 1);
+    let fnt_bracket_start = start + md[start..].find('[').context("missing [")?;
+    Ok(fnt_bracket_start - line_start)
+}
+
 fn scan_multiline_footnote(
     md: &str,
-    end: usize,
-    base_indent: usize,
+    range_firstline: &std::ops::Range<usize>,
 ) -> Result<ScannedMultilineFootnote> {
+    let end = range_firstline.end;
+
+    // Find out indentation level
+    let base_indent = find_footnote_indent(md, range_firstline.start)?;
+
     // Find first non-whitespace non-newline
     let mut indent = 0;
     let mut pos = end;
@@ -405,6 +416,7 @@ fn link_reference_label_from_range(md: &str, range: std::ops::Range<usize>) -> R
 
 struct ParsedFootnote<'input> {
     range: std::ops::Range<usize>,
+    indent: usize,
     link_references: Vec<&'input str>,
 }
 
@@ -415,7 +427,8 @@ struct Splitter<'input> {
     metadata: Option<Metadata>,
     blocks: Vec<ParsedBlock<'input>>,
     level: i32,
-    footnote_definitions: std::collections::HashMap<CowStr<'input>, ParsedFootnote<'input>>,
+    footnote_definitions: HashMap<CowStr<'input>, ParsedFootnote<'input>>,
+    additional_reference_definitions: HashMap<UniCase<CowStr<'input>>, std::ops::Range<usize>>,
 }
 
 impl<'input> Splitter<'input> {
@@ -452,8 +465,24 @@ impl<'input> Splitter<'input> {
             metadata: None,
             blocks: Vec::new(), // TODO: capacity? guess from last one?
             level: 0,
-            footnote_definitions: std::collections::HashMap::new(),
+            footnote_definitions: HashMap::new(),
+            additional_reference_definitions: HashMap::new(),
         }
+    }
+
+    fn maybe_parse_yaml_metadata_block(&mut self, start: usize) -> Option<usize> {
+        let (yaml_end, parsed_yaml) = try_parse_yaml_metadata_block(self.md, start)?;
+
+        if let Some(ref mut metadata) = self.metadata {
+            // A second/third/... metadata block. Merge it into the existing one
+            for (key, value) in parsed_yaml.into_iter() {
+                metadata.insert(key, value);
+            }
+        } else {
+            // First metadata block, use it directly
+            self.metadata = Some(parsed_yaml);
+        }
+        Some(yaml_end)
     }
 
     fn split(&mut self) -> Result<()> {
@@ -464,17 +493,61 @@ impl<'input> Splitter<'input> {
         let mut current_block_footnote_references = Vec::new();
         let mut current_block_link_references = Vec::new();
 
+        let mut fn_range: Option<std::ops::Range<usize>> = None;
+        let mut fn_label = CowStr::Borrowed("");
+        let mut fn_link_references = Vec::new();
+
         let mut skip_until = 0;
         while let Some((event, range)) = self.offset_iter.next() {
             // Skip e.g. yaml metadata block we parsed ourselves
             if range.start < skip_until {
+                // Still keep track of level.
+                match event {
+                    Event::Start(_) => self.level += 1,
+                    Event::End(_) => self.level -= 1,
+                    _ => {}
+                }
                 continue;
+            }
+
+            // Add footnote definitions for which we don't get an End(FootnoteDefinition) event.
+            // Happens for those that look like a FootnoteReference to pulldown-cmark (see
+            // `is_definition` below).
+            if let Some(ref fn_range_val) = fn_range {
+                if range.start > fn_range_val.end {
+                    skip_until = self.footnote_add(
+                        fn_range_val.clone(),
+                        &mut fn_label,
+                        &mut fn_link_references,
+                    )?;
+                    fn_range = None;
+                    if range.start < skip_until {
+                        // Still keep track of level.
+                        match event {
+                            Event::Start(_) => self.level += 1,
+                            Event::End(_) => self.level -= 1,
+                            _ => {}
+                        }
+                        continue;
+                    }
+                }
             }
 
             match event {
                 Event::Start(Tag::FootnoteDefinition(label)) => {
                     self.level += 1;
-                    skip_until = self.scan_and_parse_footnote(label, range)?;
+                    fn_range = Some(range);
+                    fn_label = label;
+                }
+                Event::End(Tag::FootnoteDefinition(_)) => {
+                    // Add footnote, scanning for multiline continuation
+                    let multiline_fn_end = self.footnote_add(
+                        fn_range.take().context("no fn range?")?,
+                        &mut fn_label,
+                        &mut fn_link_references,
+                    )?;
+                    skip_until = multiline_fn_end;
+                    self.level -= 1;
                 }
                 Event::Start(Tag::Item) => {
                     self.level += 1;
@@ -509,39 +582,50 @@ impl<'input> Splitter<'input> {
                     | Tag::Link(pulldown_cmark::LinkType::Shortcut, _, _) = tag
                     {
                         let label = link_reference_label_from_range(self.md, range.clone())?;
-                        current_block_link_references.push(label);
+                        if fn_range.is_some() {
+                            fn_link_references.push(label);
+                        } else {
+                            current_block_link_references.push(label);
+                        }
                     }
 
-                    if self.level == 0 {
-                        // Pandoc sometimes continues a list when pulldown-cmark starts
-                        // a new block. Detect and handle this.
-                        let range = if let Tag::List(_) = tag {
-                            // TODO: keep track of used links inside the skipped block, something like `self.scan_and_parse_footnote()`
-                            // TODO: nested list continuation?
-                            // TODO: keep track of footnote definitions within nested list (can this actually happen?)
-                            // TODO: yaml metadata block inside?
-                            let scanned_list_end =
-                                scan_list_continuation(self.md, last_li_start, range.end)?;
-                            if scanned_list_end.continuation.is_some() {
-                                // Do not add the would-be-ending list as a block.
-                                // This continued list will be concatenated together with the next block.
-                                //
-                                // Note: The next block may or may not be a continuation of the current list.
-                                // So sometimes we make one block out of what should be two blocks.
-                                // This may hurt performance a bit, but it's not a correctness problem!
-                                //
-                                // Note also: If skip_until lies beyond the last block, it can happen that this
-                                // block is never added here. That's why we add any remaining "dangling" below
-                                // after the loop over events.
-                                skip_until = scanned_list_end.end;
-                                continue;
-                            } else {
-                                range
-                            }
+                    // Pandoc sometimes continues a list when pulldown-cmark starts
+                    // a new block. Detect and handle this.
+                    let range = if let Tag::List(_) = tag {
+                        let scanned_list_end =
+                            scan_list_continuation(self.md, last_li_start, range.end)?;
+                        if scanned_list_end.continuation.is_some() {
+                            // We cannot just skip to `scanned_list_end.end` directly because
+                            // the skipped parts might e.g. contain link references or footnote
+                            // definitions that we might miss (especially if they're 4-space
+                            // indented and so look like a CodeBlock to pulldown-cmark).
+                            self.list_blank_item_continuation(
+                                range,
+                                &scanned_list_end,
+                                &mut current_block_link_references,
+                                &mut current_block_footnote_references,
+                            )?;
+
+                            // Do not add the would-be-ending list as a block.
+                            // This continued list will be concatenated together with the next block.
+                            //
+                            // Note: The next block may or may not be a continuation of the current list.
+                            // So sometimes we make one block out of what should be two blocks.
+                            // This may hurt performance a bit, but it's not a correctness problem!
+                            //
+                            // Note also: If skip_until lies beyond the last block, it can happen that this
+                            // block is never added here. That's why we add any remaining "dangling" below
+                            // after the loop over events.
+                            skip_until = scanned_list_end.end;
+                            continue;
                         } else {
                             range
-                        };
+                        }
+                    } else {
+                        range
+                    };
 
+                    if self.level == 0 {
                         self.blocks.push(ParsedBlock {
                             footnote_references: std::mem::take(
                                 &mut current_block_footnote_references,
@@ -553,23 +637,55 @@ impl<'input> Splitter<'input> {
                 }
 
                 Event::FootnoteReference(label) => {
-                    current_block_footnote_references.push(label);
+                    if let Some(ref fn_range_val) = fn_range {
+                        // Pandoc compatibility: pandoc allows footnote definitions separated by \n, pulldown-cmark needs \n\n.
+                        // So for pulldown-cmark, something like this
+                        // [^1]: Footnote 1
+                        // [^2]: Footnote 2
+                        // looks like a single footnote definition for ^1 that references footnote ^2. But for us it should be
+                        // two footnote definitions.
+                        // Pandoc does not allow one footnote referencing another one, so this won't accidentally introduce a
+                        // different compatibility issue here.
+                        //
+                        // Can be removed (also in self.footnote_multiline_continuation) when this is fixed?
+                        // https://github.com/raphlinus/pulldown-cmark/issues/618
+                        self.footnote_definitions.insert(
+                            std::mem::replace(&mut fn_label, label),
+                            ParsedFootnote {
+                                range: fn_range_val.start..range.start - 1,
+                                indent: find_footnote_indent(md, fn_range_val.start)?,
+                                link_references: std::mem::take(&mut fn_link_references),
+                            },
+                        );
+                        fn_range = Some(range.start..fn_range_val.end);
+                    } else {
+                        // It's actually a footnote definition if followed by ":" and blank before label
+                        // for pandoc. pulldown-cmark doesn't recognize it.
+                        let is_definition = if self.md[range.end..].starts_with(": ") {
+                            self.md[self.md[..range.start].rfind('\n').map_or(0, |x| x + 1)
+                                ..range.start]
+                                .trim()
+                                .is_empty()
+                        } else {
+                            false
+                        };
+
+                        if is_definition {
+                            let end = range.end
+                                + self.md[range.end..].find('\n').unwrap_or(self.md.len());
+                            fn_range = Some(range.start..end);
+                            fn_label = label;
+                        } else {
+                            // Footnote is just referenced in block (the "normal" case)
+                            current_block_footnote_references.push(label);
+                        }
+                    }
                 }
 
                 Event::Rule if self.level == 0 => {
                     // A Rule may indicate a yaml metadata block
-                    if let Some((yaml_end, parsed_yaml)) =
-                        try_parse_yaml_metadata_block(md, range.start)
-                    {
-                        if let Some(ref mut metadata) = self.metadata {
-                            // A second/third/... metadata block. Merge it into the existing one
-                            for (key, value) in parsed_yaml.into_iter() {
-                                metadata.insert(key, value);
-                            }
-                        } else {
-                            // First metadata block, use it directly
-                            self.metadata = Some(parsed_yaml);
-                        }
+                    if let Some(yaml_end) = self.maybe_parse_yaml_metadata_block(range.start) {
+                        // Skip the parsed block
                         skip_until = yaml_end;
                     } else {
                         // A top-level Rule
@@ -595,6 +711,11 @@ impl<'input> Splitter<'input> {
             }
         }
 
+        // Add any remaining "dangling" footnote definitions
+        if let Some(fn_range) = fn_range {
+            let _ = self.footnote_add(fn_range, &mut fn_label, &mut fn_link_references)?;
+        }
+
         // Add any remaining "dangling" blocks, see list continuation
         if let Some(start) = current_block_start {
             self.blocks.push(ParsedBlock {
@@ -616,109 +737,20 @@ impl<'input> Splitter<'input> {
         Ok(())
     }
 
-    fn scan_and_parse_footnote(
+    fn list_blank_item_continuation(
         &mut self,
-        mut label: CowStr<'input>,
-        range: std::ops::Range<usize>,
-    ) -> Result<usize> {
-        // First handle the normal non-multiline stuff
-        let mut link_references = Vec::new();
-        let mut start = range.start;
-        while let Some((event, range)) = self.offset_iter.next() {
-            match event {
-                Event::End(Tag::Link(pulldown_cmark::LinkType::Reference, _, _))
-                | Event::End(Tag::Link(pulldown_cmark::LinkType::Shortcut, _, _)) => {
-                    let label = link_reference_label_from_range(self.md, range)?;
-                    link_references.push(label);
-                }
-
-                Event::FootnoteReference(ref_label) => {
-                    // Pandoc compatibility: pandoc allows footnote definitions separated by \n, pulldown-cmark needs \n\n.
-                    // So for pulldown-cmark, something like this
-                    // [^1]: Footnote 1
-                    // [^2]: Footnote 2
-                    // looks like a single footnote definition for ^1 that references footnote ^2. But for us it should be
-                    // two footnote definitions.
-                    // Pandoc does not allow one footnote referencing another one, so this won't accidentally introduce a
-                    // different compatibility issue here.
-                    //
-                    // Can be removed (also in self.footnote_multiline_continuation) when this is fixed?
-                    // https://github.com/raphlinus/pulldown-cmark/issues/618
-                    self.footnote_definitions.insert(
-                        std::mem::replace(&mut label, ref_label),
-                        ParsedFootnote {
-                            range: start..range.start - 1,
-                            link_references: std::mem::replace(&mut link_references, Vec::new()),
-                        },
-                    );
-                    start = range.start;
-                }
-
-                Event::End(Tag::FootnoteDefinition(_)) => {
-                    break;
-                }
-                _ => {}
-            }
-        }
-        let range = start..range.end;
-
-        // Find out how long this footnote block actually is
-        let multiline_fn = scan_multiline_footnote(self.md, range.end, 0)?;
-
-        if multiline_fn.continuation.is_none() {
-            // Just a single-line footnote
-            self.footnote_definitions.insert(
-                label,
-                ParsedFootnote {
-                    range,
-                    link_references,
-                },
-            );
-        } else {
-            // It's a multiline footnote
-            self.footnote_multiline_continuation(
-                &multiline_fn,
-                range,
-                None,
-                label,
-                link_references,
-            )?;
-        }
-
-        self.level -= 1;
-
-        Ok(multiline_fn.end)
-    }
-
-    fn footnote_multiline_continuation(
-        &mut self,
-        multiline_fn: &ScannedMultilineFootnote,
-        range_firstline: std::ops::Range<usize>,
-        range_outer: Option<&std::ops::Range<usize>>,
-        label: CowStr<'input>,
-        mut link_references: Vec<&'input str>,
+        range_list_cmark: std::ops::Range<usize>,
+        scanned_list_end: &ScannedListEnd,
+        current_block_link_references: &mut Vec<&'input str>,
+        current_block_footnote_references: &mut Vec<CowStr<'input>>,
     ) -> Result<()> {
-        let continuation = multiline_fn.continuation.as_ref().unwrap();
+        let continuation = scanned_list_end.continuation.as_ref().unwrap();
         let cont_md = &continuation.unindented_md;
         let space_deletion_points = &continuation.space_deletion_points;
 
-        // Translates from a range in `cont_md` to a range in the original `self.md`
-        let translate_cont_range_to_orig_md = |cont_range: &std::ops::Range<usize>| {
-            let mut start = range_firstline.end + cont_range.start;
-            let mut end = range_firstline.end + cont_range.end;
-            for (deletion_point, ndel) in space_deletion_points.iter() {
-                if start > *deletion_point {
-                    start += ndel;
-                    end += ndel;
-                } else if end > *deletion_point {
-                    end += ndel;
-                } else {
-                    // Small perf optimization
-                    break;
-                }
-            }
-            start..end
-        };
+        let mut nested_footnote_range: Option<std::ops::Range<usize>> = None;
+        let mut nested_fn_label = CowStr::Borrowed("");
+        let mut nested_fn_link_references = Vec::new();
 
         let mut options = pulldown_cmark::Options::empty();
         options.insert(pulldown_cmark::Options::ENABLE_FOOTNOTES);
@@ -728,53 +760,251 @@ impl<'input> Splitter<'input> {
             // If that's wrong, nothing bad happens, pandoc will notice later
             Some((CowStr::Borrowed(""), CowStr::Borrowed("")))
         };
-        let parser = pulldown_cmark::Parser::new_with_broken_link_callback(
-            &cont_md,
+        let fake_offset_iter = pulldown_cmark::Parser::new_with_broken_link_callback(
+            cont_md,
             options,
             Some(&mut broken_link_callback),
-        );
+        )
+        .into_offset_iter();
+
+        // Remember reference definitions.
+        // These might already be in self.offset_iter.reference_definitions()
+        // but they also might not. For example, if [link]: https://... is indented
+        // by 4 or more spaces, pulldown-cmark might see them as an indented code block.
+        // So just add them.
+        for (label, link_def) in fake_offset_iter.reference_definitions().iter() {
+            let range_orig = Self::translate_cont_range_to_orig_md(
+                &range_list_cmark,
+                &link_def.span,
+                space_deletion_points,
+            );
+            let key = &self.md[range_orig.start + 1..range_orig.start + 1 + label.len()];
+            let key = UniCase::new(CowStr::Borrowed(key));
+            self.additional_reference_definitions
+                .insert(key, range_orig);
+        }
+
+        let mut last_li_start = 0;
+
+        let mut skip_until = 0;
+        for (cont_event, cont_range) in fake_offset_iter {
+            let range_orig = Self::translate_cont_range_to_orig_md(
+                &range_list_cmark,
+                &cont_range,
+                space_deletion_points,
+            );
+            if range_orig.start < skip_until {
+                continue;
+            }
+
+            // Add footnote definitions for which we don't receive an End(FootnoteDefinition)
+            // event. Can happen for footnote definitions that look like a FootnoteReference
+            // to pulldown-cmark (see `is_definition` below).
+            if let Some(ref nested_range) = nested_footnote_range {
+                if range_orig.start > nested_range.end {
+                    skip_until = self.footnote_add(
+                        nested_range.clone(),
+                        &mut nested_fn_label,
+                        &mut nested_fn_link_references,
+                    )?;
+                    nested_footnote_range = None;
+                    if range_orig.start < skip_until {
+                        continue;
+                    }
+                }
+            }
+
+            match cont_event {
+                // TODO: does pandoc allow an indented yaml metadata block inside list?
+                Event::End(Tag::Link(pulldown_cmark::LinkType::Reference, _, _))
+                | Event::End(Tag::Link(pulldown_cmark::LinkType::Shortcut, _, _))
+                | Event::End(Tag::Link(pulldown_cmark::LinkType::ShortcutUnknown, _, _)) => {
+                    let label = link_reference_label_from_range(self.md, range_orig)?;
+                    if nested_footnote_range.is_some() {
+                        nested_fn_link_references.push(label);
+                    } else {
+                        current_block_link_references.push(label);
+                    }
+                }
+
+                Event::FootnoteReference(label) => {
+                    // We need `label` to reference `self.md` not `cont_md`
+                    let label_pos = range_orig.start
+                        + self.md[range_orig.start..range_orig.end]
+                            .find(label.as_ref())
+                            .context("label not found")?;
+                    let label = &self.md[label_pos..label_pos + label.len()];
+
+                    // It's actually a footnote definition if followed by ":" and blank before label
+                    // for pandoc. But pulldown-cmark just doesn't recognize it.
+                    let is_definition = if cont_md[cont_range.end..].starts_with(": ") {
+                        cont_md[cont_md[..cont_range.start].rfind('\n').map_or(0, |x| x + 1)
+                            ..cont_range.start]
+                            .trim()
+                            .is_empty()
+                    } else {
+                        false
+                    };
+
+                    if is_definition {
+                        let end = range_orig.end
+                            + self.md[range_orig.end..]
+                                .find('\n')
+                                .unwrap_or(self.md.len());
+                        nested_footnote_range = Some(range_orig.start..end);
+                        nested_fn_label = CowStr::Borrowed(label);
+                    } else {
+                        current_block_footnote_references.push(CowStr::Borrowed(label));
+                    }
+                }
+
+                Event::Start(Tag::Item) => {
+                    last_li_start = range_orig.start;
+                }
+
+                Event::End(Tag::List(_)) => {
+                    let scanned_list_end =
+                        scan_list_continuation(self.md, last_li_start, range_orig.end)?;
+                    if scanned_list_end.continuation.is_some() {
+                        // Nested list continuation
+                        self.list_blank_item_continuation(
+                            range_orig,
+                            &scanned_list_end,
+                            current_block_link_references,
+                            current_block_footnote_references,
+                        )?;
+
+                        // Skip the rest of this list, it's parsed in the nested
+                        // `list_blank_item_continuation` call
+                        skip_until = scanned_list_end.end;
+                    }
+                }
+
+                _ => {}
+            }
+        }
+
+        if let Some(nested_range) = nested_footnote_range {
+            let _ = self.footnote_add(
+                nested_range,
+                &mut nested_fn_label,
+                &mut nested_fn_link_references,
+            )?;
+        }
+
+        Ok(())
+    }
+
+    fn footnote_add(
+        &mut self,
+        range_firstline: std::ops::Range<usize>,
+        label: &mut CowStr<'input>,
+        link_references: &mut Vec<&'input str>,
+    ) -> Result<usize> {
+        // Find out how long this footnote block actually is
+        let multiline_fn = scan_multiline_footnote(self.md, &range_firstline)?;
+
+        if multiline_fn.continuation.is_none() {
+            // Just a single-line footnote
+            self.footnote_definitions.insert(
+                std::mem::replace(label, CowStr::Borrowed("")),
+                ParsedFootnote {
+                    range: range_firstline,
+                    indent: multiline_fn.base_indent,
+                    link_references: std::mem::take(link_references),
+                },
+            );
+        } else {
+            // It's a multiline footnote
+            self.footnote_multiline_continuation(
+                &multiline_fn,
+                range_firstline,
+                std::mem::replace(label, CowStr::Borrowed("")),
+                std::mem::take(link_references),
+            )?;
+        }
+
+        Ok(multiline_fn.end)
+    }
+
+    // Translates from a range in `cont_md` to a range in the original `self.md`
+    fn translate_cont_range_to_orig_md(
+        range_orig_base: &std::ops::Range<usize>,
+        cont_range: &std::ops::Range<usize>,
+        space_deletion_points: &[(usize, usize)],
+    ) -> std::ops::Range<usize> {
+        let mut start = range_orig_base.end + cont_range.start;
+        let mut end = range_orig_base.end + cont_range.end;
+        for (deletion_point, ndel) in space_deletion_points.iter() {
+            if start > *deletion_point {
+                start += ndel;
+                end += ndel;
+            } else if end > *deletion_point {
+                end += ndel;
+            } else {
+                // Small perf optimization
+                break;
+            }
+        }
+        start..end
+    }
+
+    fn footnote_multiline_continuation(
+        &mut self,
+        multiline_fn: &ScannedMultilineFootnote,
+        mut range_firstline: std::ops::Range<usize>,
+        label: CowStr<'input>,
+        mut link_references: Vec<&'input str>,
+    ) -> Result<()> {
+        let mut base_indent = multiline_fn.base_indent;
+        let continuation = multiline_fn.continuation.as_ref().unwrap();
+        let cont_md = &continuation.unindented_md;
+        let space_deletion_points = &continuation.space_deletion_points;
+
+        let mut options = pulldown_cmark::Options::empty();
+        options.insert(pulldown_cmark::Options::ENABLE_FOOTNOTES);
+
+        let mut broken_link_callback = |_broken: pulldown_cmark::BrokenLink| {
+            // pretend every reference exists.
+            // If that's wrong, nothing bad happens, pandoc will notice later
+            Some((CowStr::Borrowed(""), CowStr::Borrowed("")))
+        };
+        let fake_offset_iter = pulldown_cmark::Parser::new_with_broken_link_callback(
+            cont_md,
+            options,
+            Some(&mut broken_link_callback),
+        )
+        .into_offset_iter();
 
         // TODO: new reference_definitions? Is this possible within multiline footnote?
 
-        // For all nested footnotes, we push the *whole* footnote block to `self.footnote_definitions`.
-        // That is, for the footnote [^nested] in this definition
+        // For footnotes containing nested footnotes we include any inner nested footnotes in
+        // its range in `self.footnote_definitions`. That is, for the footnote [^outer]
         //
         // [^outer]: Outer
         //
         //    [^nested]: Inner
         //
-        //
-        // We push the whole thing to `self.footnote_definitions`, including `[^outer]`.
-        // This is because otherwise, blocks referencing [^nested] see this footnote definition
-        //
-        //     [^nested]
-        //
-        // But without the enclosing [^outer] definition, this is actually an indented code block
-        // for pandoc, so it will not work!
-        //
-        // We could try to unindent the footnote, but then we can no longer just push `Range`s to
-        // `self.footnote_definitions`, which makes things more complicated.
-        //
-        // Just always pushing the outer block is of course not optimal for perf, but I think nested
-        // footnotes are uncommon, so it doesn't matter much.
-        //
         // Note that this will lead to multiple definitions in blocks that reference both [^outer]
-        // and [^inner]. The same whole block will be pasted twice at the end (in `self.finalize()`).
-        // But it seems this is fine for pandoc, so it's also fine for us.
+        // and [^inner]. But it seems this is fine for pandoc, so it's also fine for us.
 
         let mut in_nested_footnote = false;
         let mut nested_label = CowStr::Borrowed("");
         let mut nested_link_references = Vec::new();
 
         let mut skip_until = 0;
-        let mut fake_offset_iter = parser.into_offset_iter();
-        while let Some((cont_event, cont_range)) = fake_offset_iter.next() {
-            let range_orig = translate_cont_range_to_orig_md(&cont_range);
+        for (cont_event, cont_range) in fake_offset_iter {
+            let range_orig = Self::translate_cont_range_to_orig_md(
+                &range_firstline,
+                &cont_range,
+                space_deletion_points,
+            );
             if range_orig.start < skip_until {
                 continue;
             }
 
             match cont_event {
+                // TODO: Detect nested list item with blank first line (i.e. call `self.list_blank_item_continuation()` appropriately)
                 // TODO: pandoc allows an indented yaml metadata block inside multiline footnote. Handle + skip it!
                 Event::End(Tag::Link(pulldown_cmark::LinkType::Reference, _, _))
                 | Event::End(Tag::Link(pulldown_cmark::LinkType::Shortcut, _, _))
@@ -816,55 +1046,30 @@ impl<'input> Splitter<'input> {
                     self.footnote_definitions.insert(
                         std::mem::replace(&mut nested_label, CowStr::Borrowed(ref_label)),
                         ParsedFootnote {
-                            range: range_outer.map_or_else(
-                                || range_firstline.start..multiline_fn.end,
-                                |ro| ro.clone(),
-                            ),
-                            link_references: std::mem::replace(
-                                &mut nested_link_references,
-                                Vec::new(),
-                            ),
+                            range: range_firstline.start..range_orig.start - 1,
+                            indent: base_indent,
+                            link_references: std::mem::take(&mut nested_link_references),
                         },
                     );
+                    // Act as if the original footnote definition started here
+                    range_firstline = range_orig.start
+                        ..range_orig.end
+                            + self.md[range_orig.end..]
+                                .find('\n')
+                                .unwrap_or(self.md.len());
+                    base_indent = find_footnote_indent(self.md, range_orig.start)?;
                 }
 
                 Event::End(Tag::FootnoteDefinition(_)) => {
-                    // Find out how long this footnote block actually is
-                    let nested_multiline_fn = scan_multiline_footnote(
-                        self.md,
-                        range_orig.end,
-                        multiline_fn.base_indent + 4,
+                    let nested_multiline_fn_end = self.footnote_add(
+                        range_orig,
+                        &mut nested_label,
+                        &mut nested_link_references,
                     )?;
 
-                    let immediate_parent_range = range_firstline.start..multiline_fn.end;
-
-                    if nested_multiline_fn.continuation.is_none() {
-                        // Just a single-line footnote
-                        self.footnote_definitions.insert(
-                            std::mem::replace(&mut nested_label, CowStr::Borrowed("")),
-                            ParsedFootnote {
-                                range: range_outer
-                                    .map_or_else(|| immediate_parent_range, |ro| ro.clone()),
-                                link_references: std::mem::replace(
-                                    &mut nested_link_references,
-                                    Vec::new(),
-                                ),
-                            },
-                        );
-                    } else {
-                        // It's a multiline footnote
-                        self.footnote_multiline_continuation(
-                            &nested_multiline_fn,
-                            range_orig,
-                            range_outer.or_else(|| Some(&immediate_parent_range)),
-                            std::mem::replace(&mut nested_label, CowStr::Borrowed("")),
-                            std::mem::replace(&mut nested_link_references, Vec::new()),
-                        )?;
-                    }
-
-                    self.level -= 1;
-                    skip_until = nested_multiline_fn.end;
+                    skip_until = nested_multiline_fn_end;
                     in_nested_footnote = false;
+                    self.level -= 1;
                 }
 
                 _ => {}
@@ -874,8 +1079,8 @@ impl<'input> Splitter<'input> {
         self.footnote_definitions.insert(
             label,
             ParsedFootnote {
-                range: range_outer
-                    .map_or_else(|| range_firstline.start..multiline_fn.end, |ro| ro.clone()),
+                range: range_firstline.start..multiline_fn.end,
+                indent: base_indent,
                 link_references,
             },
         );
@@ -886,11 +1091,22 @@ impl<'input> Splitter<'input> {
     fn finalize(self) -> Result<SplitMarkdown> {
         let ref_defs = self.offset_iter.reference_definitions();
 
+        let get_ref_def_range = |label| {
+            ref_defs.get(label).map(|def| &def.span).or_else(|| {
+                self.additional_reference_definitions
+                    .get(&UniCase::new(label.into()))
+            })
+        };
+
+        const DIV_DISPLAY_NONE_START: &str = "<div style=\"display: none;\">";
+        const DIV_DISPLAY_NONE_END: &str = "</div>";
+        const DIV_DISPLAY_NONE_LEN: usize =
+            DIV_DISPLAY_NONE_START.len() + DIV_DISPLAY_NONE_END.len();
+
         let blocks = self
             .blocks
             .iter()
             .map(|block| {
-
                 let block_md = &self.md[block.range.start..block.range.end];
                 let block_md_has_newln = block_md.ends_with('\n');
 
@@ -900,9 +1116,7 @@ impl<'input> Splitter<'input> {
                         .link_references
                         .iter()
                         .map(|label| {
-                            ref_defs
-                                .get(*label)
-                                .map_or(0, |def| def.span.end - def.span.start + 1)
+                            get_ref_def_range(label).map_or(0, |range| range.end - range.start + 1)
                         })
                         .sum::<usize>()
                     + block
@@ -910,17 +1124,25 @@ impl<'input> Splitter<'input> {
                         .iter()
                         .map(|label| {
                             self.footnote_definitions.get(label).map_or(0, |fnt| {
-                                fnt.link_references
+                                let mut length = fnt
+                                    .link_references
                                     .iter()
                                     .map(|label| {
-                                        ref_defs
-                                            .get(*label)
-                                            .map_or(0, |def| def.span.end - def.span.start + 1)
+                                        get_ref_def_range(label)
+                                            .map_or(0, |range| range.end - range.start + 1)
                                     })
                                     .sum::<usize>()
                                     + fnt.range.end
                                     - fnt.range.start
-                                    + 2
+                                    + 2;
+                                if fnt.indent >= 4 {
+                                    let n = fnt.indent % 4;
+                                    length += DIV_DISPLAY_NONE_LEN + 2
+                                        + 4*(n*(n+1)/2) // spaces and -
+                                        + n // newlines
+                                        ;
+                                }
+                                length
                             })
                         })
                         .sum::<usize>();
@@ -935,8 +1157,8 @@ impl<'input> Splitter<'input> {
                 // add definitions
                 for label in &block.link_references {
                     // don't just unwrap in case of missing definition (common while typing!)
-                    if let Some(def) = ref_defs.get(*label) {
-                        writeln!(buf, "{}", &self.md[def.span.start..def.span.end])?;
+                    if let Some(range) = get_ref_def_range(label) {
+                        writeln!(buf, "{}", &self.md[range.clone()])?;
                     }
                 }
                 // add footnotes
@@ -944,7 +1166,23 @@ impl<'input> Splitter<'input> {
                     // don't just unwrap in case of missing definition (common while typing!)
                     if let Some(fnt) = self.footnote_definitions.get(label) {
                         // footnote definitions
-                        let def = &self.md[fnt.range.start..fnt.range.end];
+
+                        // Because multiline footnotes are sensitive to indentation, we preserve
+                        // indentation. But if the whole footnote block is indented by >= 4 spaces,
+                        // pandoc will then recognize it as a CodeBlock, not a footnote definition.
+                        // To avoid this, exploit the fact that pandoc allows footnote definitions
+                        // in lists and put them in a fake nested list.
+                        let mut indent = 0;
+                        while 4 + indent <= fnt.indent {
+                            if indent == 0 {
+                                writeln!(buf, "{}", DIV_DISPLAY_NONE_START)?;
+                            }
+                            writeln!(buf, "{}   -", " ".repeat(indent))?;
+                            indent += 4;
+                        }
+                        let line_start =
+                            self.md[..fnt.range.start].rfind('\n').map_or(0, |x| x + 1);
+                        let def = &self.md[line_start..fnt.range.end];
                         write!(buf, "{}", def)?;
                         if !def.ends_with('\n') {
                             write!(buf, "\n\n")?;
@@ -952,11 +1190,15 @@ impl<'input> Splitter<'input> {
                             writeln!(buf)?;
                         }
 
+                        if indent > 0 {
+                            writeln!(buf, "{}", DIV_DISPLAY_NONE_END)?;
+                        }
+
                         // footnote link references
                         for label in &fnt.link_references {
                             // don't just unwrap in case of missing definition (common while typing!)
-                            if let Some(def) = ref_defs.get(*label) {
-                                writeln!(buf, "{}", &self.md[def.span.start..def.span.end])?;
+                            if let Some(range) = get_ref_def_range(label) {
+                                writeln!(buf, "{}", &self.md[range.clone()])?;
                             }
                         }
                     }
@@ -1193,9 +1435,6 @@ mod tests {
         let (md, _) = read_file("footnote-with-link-references-nested-footnote-defs.md")?;
         let md = std::str::from_utf8(&md)?;
         let split = md2mdblocks(md).await?;
-
-        // Note that nested footnote blocks are always appended to md blocks in full
-        // i.e. not just the parts that are actually needed, see `Splitter::footnote_multiline_continuation`
         assert_eq!(split.blocks.len(), 2);
         assert_eq!(
             split.blocks[0],
@@ -1233,16 +1472,13 @@ mod tests {
             indoc::indoc! {"
             Nested ones: [^nested] [^longnested]
 
-            [^longnote]: Here another one
-
-                that uses the link only in a multiline continuation.
-
+            <div style=\"display: none;\">
+               -
                 [^nested]: And then we get another footnote
 
-            [^longnote2]: A second long footnote with nested stuff
-
-                second line
-
+            </div>
+            <div style=\"display: none;\">
+               -
                 [^longnested]: longnested??
 
                     longnested cont
@@ -1252,8 +1488,7 @@ mod tests {
             longnested cont4
               longnested cont5
 
-                back to longnote2
-
+            </div>
             [gh]: https://github.com/
             "}
         );
@@ -1333,6 +1568,87 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn list_item_with_gap_and_footnote_and_reference_defs() -> Result<()> {
+        let (md, _) = read_file("list-item-with-gap-and-footnote-defs-and-link-defs.md")?;
+        let md = std::str::from_utf8(&md)?;
+        let split = md2mdblocks(md).await?;
+
+        assert_eq!(split.blocks.len(), 3);
+
+        assert_eq!(
+            split.blocks[0],
+            // NOTE: The algorithm in `Splitter.list_blank_item_continuation()` concatenates
+            //       any list that we manually continue (b/c of a "blank" list item) with the
+            //       following block. That's why the "Buffer block" here is in the first block.
+            indoc::indoc! {"
+                 -
+
+                     test [link]
+
+                     - list inside [^1]
+                     - list cont
+                     -
+                         asdf [liNK2]
+
+                         [^2]: fn 2
+
+                [link]: https://github.com
+
+                [^1]: fn 1
+
+                Buffer block
+
+                [link]: https://github.com
+                [LInk2]: https://github.com
+                [^1]: fn 1
+
+        "}
+        );
+        assert_eq!(
+            split.blocks[1],
+            indoc::indoc! {"
+                Here's [^2] another block
+
+                <div style=\"display: none;\">
+                   -
+                       -
+                         [^2]: fn 2
+
+                </div>
+        "}
+        );
+        assert_eq!(
+            split.blocks[2],
+            indoc::indoc! {"
+                - non-blank list item
+
+                    continuation line [^3]
+
+                    [^4]: fn 4
+
+                    -
+
+                        [LInk2]: https://github.com
+
+
+                [^3]: fn 3
+
+                Here's a [^4] using block
+
+                [^3]: fn 3
+
+                <div style=\"display: none;\">
+                   -
+                    [^4]: fn 4
+
+                </div>
+        "}
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn indented_codeblock() -> Result<()> {
         let (md, _) = read_file("indented-codeblock.md")?;
         let md = std::str::from_utf8(&md)?;
@@ -1361,15 +1677,13 @@ mod tests {
     #[tokio::test]
     async fn scan_multiline_footnote_basic() -> Result<()> {
         let md = "other\n\n[^1]: asdf";
-        let scanned = scan_multiline_footnote(&md, md.len() - 1, 0)?;
+        let scanned = scan_multiline_footnote(md, &(7..md.len() - 1))?;
         assert_eq!(scanned.end, md.len() - 1);
-        assert_eq!(scanned.base_indent, 0);
         assert!(scanned.continuation.is_none());
 
         let md = "other\n\n[^1]: asdf\n\n    bsdf\n\ncsdf";
-        let scanned = scan_multiline_footnote(&md, 19, 0)?;
+        let scanned = scan_multiline_footnote(md, &(7..19))?;
         assert_eq!(&md[19..scanned.end], "    bsdf\n\n");
-        assert_eq!(scanned.base_indent, 0);
         assert!(scanned.continuation.is_some());
         assert_eq!(
             scanned.continuation.as_ref().unwrap().unindented_md,
@@ -1398,8 +1712,7 @@ mod tests {
                 csdf
         "};
         let pos = md.find("nested1").unwrap() + 8;
-        let scanned = scan_multiline_footnote(&md, pos, 4)?;
-        assert_eq!(scanned.base_indent, 4);
+        let scanned = scan_multiline_footnote(md, &(pos - 8 - 11..pos))?;
         assert_eq!(
             &md[pos..scanned.end],
             "        nested2\n\n        nested3\n    nested4\n\n        nested5\n\n"
@@ -1417,7 +1730,7 @@ mod tests {
 
     fn scan_list_helper(md: &str) -> Result<(usize, ScannedListEnd)> {
         let mut last_li_start = 0;
-        let (_, range) = pulldown_cmark::Parser::new(&md)
+        let (_, range) = pulldown_cmark::Parser::new(md)
             .into_offset_iter()
             .find(|(event, range)| match event {
                 Event::End(Tag::List(_)) => true,
@@ -1430,7 +1743,7 @@ mod tests {
             .context("no list end")?;
         Ok((
             range.start,
-            scan_list_continuation(&md, last_li_start, range.end)?,
+            scan_list_continuation(md, last_li_start, range.end)?,
         ))
     }
 
@@ -1474,7 +1787,10 @@ mod tests {
         );
 
         let (_, scanned) = scan_list_helper("- test\n\n  -\n\n     test2")?;
-        assert_eq!(scanned.continuation.as_ref().unwrap().unindented_md, "  test2");
+        assert_eq!(
+            scanned.continuation.as_ref().unwrap().unindented_md,
+            "  test2"
+        );
         assert_eq!(
             scanned.continuation.as_ref().unwrap().space_deletion_points,
             vec![(13, 3)]
@@ -1499,7 +1815,45 @@ mod tests {
         let split = md2mdblocks(md).await?;
         assert_eq!(split.blocks.len(), 1);
         // Important that there are two \n in front of the [link]: definition
-        assert_eq!(split.blocks[0], "A paragraph with [link]\n\n[link]: https://github.com/\n");
+        assert_eq!(
+            split.blocks[0],
+            "A paragraph with [link]\n\n[link]: https://github.com/\n"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[ignore] // TODO: Remove when fixed
+    async fn completely_ignored_footnotes() -> Result<()> {
+        // These footnote are completely definitions are both
+        // completely ignored by pulldown_cmark with no trace of them
+        // whatsoever in the Event()s.
+        // TODO: What to do?
+        let md = indoc::indoc! {"
+             [^2]: fn2
+
+            - asdf
+
+                [^1]: fn1
+
+            - I'm refing [^1] and [^2]
+        "};
+        let split = md2mdblocks(md).await?;
+        assert_eq!(split.blocks.len(), 1);
+        assert_eq!(
+            split.blocks[0],
+            indoc::indoc! {"
+            - asdf
+
+                [^1]: fn1
+
+            - I'm refing [^1] and [^2]
+
+            [^1]: fn1
+
+             [^2]: fn2
+            "}
+        );
         Ok(())
     }
 }

@@ -1161,6 +1161,7 @@ dependencies = [
  "tokio-util",
  "tracing",
  "tracing-subscriber",
+ "unicase",
 ]
 
 [[package]]
