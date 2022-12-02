@@ -78,21 +78,13 @@ async fn handle_connection(
     home: PathBuf,
 ) -> Result<()> {
     trace!("incoming connection");
-    let mut ws_stream = tokio_tungstenite::accept_async(stream)
+    let ws_stream = tokio_tungstenite::accept_async(stream)
         .await
-        .expect("Error during the websocket handshake occurred");
+        .context("Error during the websocket handshake occurred")?;
     trace!("ws connected");
 
     // First authenticate client, then work with it
-    {
-        let auth_result = auth::try_auth_client(&mut ws_stream, &secret).await;
-        if auth_result.is_ok() {
-            // ok
-        } else {
-            // not ok
-            return auth_result;
-        }
-    }
+    let ws_stream = auth::try_auth_client(ws_stream, &secret).await?;
 
     // Add client to list of clients
     let (tx, rx) = unbounded();
@@ -139,9 +131,9 @@ struct StatusMsg<'a> {
 
 async fn progressbar(peer_map: PeerMap) -> Result<()> {
     let mut i = 0;
-    let duration = tokio::time::Duration::from_millis(300);
+    const DURATION: tokio::time::Duration = tokio::time::Duration::from_millis(300);
     loop {
-        tokio::time::sleep(duration).await;
+        tokio::time::sleep(DURATION).await;
         i += 1;
         let msg = Message::text(serde_json::to_string(&StatusMsg {
             status: &" 🞄 ".repeat(i),
@@ -226,13 +218,11 @@ async fn process_new_content(peer_map: PeerMap, queue: Queue, mut new: NewConten
         // Get next content to process, if any
         new = {
             let mut status = queue.lock().unwrap();
-            let next = status.new_content.take();
-            if let Some(next) = next {
-                next
-            } else {
+            let Some(next) = status.new_content.take() else {
                 status.processing = false;
                 break;
-            }
+            };
+            next
         };
     }
 
@@ -303,8 +293,8 @@ impl tokio_util::codec::Decoder for NewPipeContentCodec<'_> {
     type Error = anyhow::Error;
 
     fn decode(&mut self, buf: &mut BytesMut) -> Result<Option<Self::Item>> {
-        if !buf.is_empty() {
-            if buf.last().unwrap() == &0 {
+        if let Some(&last) = buf.last() {
+            if last == 0 {
                 trace!("got data, len = {}, emitting new content", buf.len() - 1);
                 // First take out complete buffer
                 let mut buf = buf.split();
@@ -477,16 +467,14 @@ pub async fn run(args: crate::Args) -> Result<()> {
     }
 
     // Start receiving content from pipe
-    let file = if let Some(fd) = fd_pipe {
+    let file = fd_pipe.map(|fd| {
         trace!("opening pipe from fd_pipe: {}", fd);
         // SAFETY: The pipe fd is used only here at startup which happens exactly once.
         // If one ever were to change this function `run` to be called twice, then
         // `read_socket_activation_fds()` would not return anything since we set `unset_env`
         // to true there.
-        Some(unsafe { tokio::fs::File::from_raw_fd(fd) })
-    } else {
-        None
-    };
+        unsafe { tokio::fs::File::from_raw_fd(fd) }
+    });
     tokio::spawn(monitorpipe(
         file,
         pipe_path.clone(),

@@ -79,10 +79,13 @@ impl std::error::Error for AuthError {}
 // does not leak the secret to a malicious server when trying to authenticate.
 // We also authenticate the server to the client so that the client can avoid
 // leaking filepaths etc. to a malicious server.
+//
+// NOTE: This function takes an owned WebSocketStream to avoid accidental use
+//       outside the authentication flow in case authentication fails.
 pub async fn try_auth_client(
-    ws_stream: &mut WebSocketStream<TcpStream>,
+    mut ws_stream: WebSocketStream<TcpStream>,
     secret: &str,
-) -> Result<()> {
+) -> Result<WebSocketStream<TcpStream>> {
     // First we send the client a challenge to authenticate the client to us ...
     let challenge = generate_token();
     let json = serde_json::to_string(&AuthMsgChallenge {
@@ -107,7 +110,7 @@ pub async fn try_auth_client(
         ws_stream.send(Message::text(json)).await?;
 
         trace!("AUTH SUCCESS");
-        Ok(())
+        Ok(ws_stream)
     } else {
         let json = serde_json::to_string(&AuthFailResponseServer { auth: false })?;
         ws_stream.send(Message::text(json)).await?;

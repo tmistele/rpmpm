@@ -1,4 +1,4 @@
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result};
 
 use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
@@ -42,27 +42,14 @@ struct PandocDocNonRawBlocks<'a> {
 
 impl<'a> PandocDoc<'a> {
     fn get_meta_flag(&self, name: &str) -> bool {
-        if let Some(val) = self.meta.get(name) {
-            if let serde_json::Value::Bool(flag) = val["c"] {
-                flag
-            } else {
-                false
-            }
-        } else {
-            false
-        }
+        self.meta
+            .get(name)
+            .map(|val| val["c"].as_bool().unwrap_or(false))
+            .unwrap_or(false)
     }
 
     fn get_meta_str(&'a self, name: &str) -> Option<&'a str> {
-        if let Some(val) = self.meta.get(name) {
-            if let serde_json::Value::String(string) = &val["c"][0]["c"] {
-                Some(string)
-            } else {
-                None
-            }
-        } else {
-            None
-        }
+        self.meta.get(name)?["c"][0]["c"].as_str()
     }
 }
 
@@ -265,16 +252,15 @@ fn mtime_from_meta_bibliography(
     bibliography: &serde_json::Map<String, serde_json::Value>,
     cwd: &Path,
 ) -> Result<u64> {
-    if let serde_json::Value::String(bibfile) = &bibliography["c"][0]["c"] {
-        let bibfile = cwd.join(PathBuf::from(bibfile));
-        let mtime = fs::metadata(bibfile)?
-            .modified()?
-            .duration_since(std::time::SystemTime::UNIX_EPOCH)?
-            .as_secs();
-        Ok(mtime)
-    } else {
-        Err(anyhow!("Unexpected json structure in bibliography"))
-    }
+    let bibfile = bibliography["c"][0]["c"]
+        .as_str()
+        .context("Unexpected json structure in bibliography")?;
+    let bibfile = cwd.join(PathBuf::from(bibfile));
+    let mtime = fs::metadata(bibfile)?
+        .modified()?
+        .duration_since(std::time::SystemTime::UNIX_EPOCH)?
+        .as_secs();
+    Ok(mtime)
 }
 
 async fn uniqueciteprocdict(
@@ -309,18 +295,14 @@ async fn uniqueciteprocdict(
             let mtime = mtime_from_meta_bibliography(bibliography, cwd)?;
             bibliography.insert("bibliography_mtimes_".to_string(), serde_json::json!(mtime));
         } else if let serde_json::Value::Array(bibs) = &bibliography["c"] {
-            let mtimes = bibs
-                .iter()
-                .map(|bibliography| {
-                    let bibliography = if let serde_json::Value::Object(x) = bibliography {
-                        x
-                    } else {
-                        return Err(anyhow!("bibliography not an Object"));
-                    };
-                    let mtime = mtime_from_meta_bibliography(bibliography, cwd)?;
-                    Ok::<serde_json::Value, anyhow::Error>(serde_json::json!(mtime))
-                })
-                .collect::<Result<Vec<serde_json::Value>>>()?;
+            let mut mtimes = Vec::with_capacity(bibs.len());
+            for bibliography in bibs {
+                let bibliography = bibliography
+                    .as_object()
+                    .context("Unexpected json structure in bibliography")?;
+                let mtime = mtime_from_meta_bibliography(bibliography, cwd)?;
+                mtimes.push(serde_json::json!(mtime));
+            }
             bibliography.insert(
                 "bibliography_mtimes_".to_string(),
                 serde_json::Value::Array(mtimes),
