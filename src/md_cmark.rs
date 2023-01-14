@@ -171,17 +171,19 @@ async fn uniqueciteprocdict(
     split_md: &split_md::SplitMarkdown,
     htmlblocks: &Vec<Htmlblock>,
     cwd: &Path,
-) -> Result<Option<Vec<u8>>> {
-    let mut cloned_yaml_metadata = split_md.metadata.clone();
+) -> Result<(Option<u64>, Option<Vec<u8>>)> {
+    let mut cloned_yaml_metadata = split_md.metadata.clone_map();
     cloned_yaml_metadata.retain(|k, _| BIBKEYS.contains(&k.as_str()));
 
     // No bib
     if cloned_yaml_metadata.is_empty() {
-        return Ok(None);
+        return Ok((None, None));
     }
 
     // TODO: add capacity?
     let mut buf = Vec::new();
+    let mut hasher = DefaultHasher::new();
+    cwd.hash(&mut hasher);
 
     // write metadata block
     writeln!(&mut buf, "---")?;
@@ -189,21 +191,16 @@ async fn uniqueciteprocdict(
     // add mtimes of bib files etc.
     match cloned_yaml_metadata.get("bibliography") {
         Some(serde_yaml::Value::String(bibfile)) => {
-            writeln!(
-                &mut buf,
-                "bibliography_mtime_: {}",
-                mtime_from_file(bibfile, cwd)?
-            )?;
+            let mtime = mtime_from_file(bibfile, cwd)?;
+            writeln!(&mut buf, "bibliography_mtime_: {}", mtime)?;
+            mtime.hash(&mut hasher);
         }
         Some(serde_yaml::Value::Sequence(bibs)) => {
             for (i, bibfile) in bibs.iter().enumerate() {
                 if let serde_yaml::Value::String(bibfile) = bibfile {
-                    writeln!(
-                        &mut buf,
-                        "bibliography_mtime_{}_: {}",
-                        i,
-                        mtime_from_file(bibfile, cwd)?
-                    )?;
+                    let mtime = mtime_from_file(bibfile, cwd)?;
+                    writeln!(&mut buf, "bibliography_mtime_{}_: {}", i, mtime)?;
+                    mtime.hash(&mut hasher);
                 }
             }
         }
@@ -212,6 +209,7 @@ async fn uniqueciteprocdict(
     if let Some(serde_yaml::Value::String(cslfile)) = cloned_yaml_metadata.get("csl") {
         let mtime = mtime_from_file(cslfile, cwd)?;
         writeln!(&mut buf, "csl_mtime_: {}", mtime)?;
+        mtime.hash(&mut hasher);
     }
 
     // write actual metadata
@@ -220,13 +218,18 @@ async fn uniqueciteprocdict(
         "{}---\n\n",
         &serde_yaml::to_string(&cloned_yaml_metadata)?
     )?;
+    // The order of HashMap entries is arbitrary, so cannot just hash buf here
+    split_md.metadata.get_hash().hash(&mut hasher);
 
     // write cite blocks
     for block in htmlblocks {
         write!(&mut buf, "{}\n\n", block.citeblocks)?;
+        block.citeblocks.hash(&mut hasher);
     }
 
-    Ok(Some(buf))
+    let bibid = hasher.finish();
+
+    Ok((Some(bibid), Some(buf)))
 }
 
 #[derive(Serialize)]
@@ -319,14 +322,16 @@ pub async fn md2htmlblocks<'a>(
     let (mut htmlblocks, titleblock) =
         if split_md.titleblock.is_some() || split_md.metadata.contains_key("title") {
             // add title block, if any
-            let mut cloned_yaml_metadata = split_md.metadata.clone();
+            let mut cloned_yaml_metadata = split_md.metadata.clone_map();
             cloned_yaml_metadata.retain(|k, _| TITLEKEYS.contains(&k.as_str()));
 
             // TODO: add capacity?
             let mut buf = Vec::new();
+            let mut titlehasher = DefaultHasher::new();
 
             // write titleblock
             if let Some(ref titleblock) = split_md.titleblock {
+                titleblock.hash(&mut titlehasher);
                 writeln!(buf, "{}", titleblock)?;
             }
             // write metadata block
@@ -337,10 +342,10 @@ pub async fn md2htmlblocks<'a>(
             )?;
 
             let titleblock = {
-                let mut hasher = DefaultHasher::new();
-                buf.hash(&mut hasher);
-                cwd.hash(&mut hasher);
-                let hash = hasher.finish();
+                cwd.hash(&mut titlehasher);
+                // The order of HashMap entries is arbitrary, so cannot just hash buf here
+                split_md.metadata.get_hash().hash(&mut titlehasher);
+                let hash = titlehasher.finish();
                 titleblock2htmlblock(&buf, hash, cwd)
             };
 
@@ -353,15 +358,7 @@ pub async fn md2htmlblocks<'a>(
         htmlblocks.insert(0, titleblock);
     }
 
-    let citejson = uniqueciteprocdict(&split_md, &htmlblocks, cwd).await?;
-    let bibid = if let Some(ref citejson) = citejson {
-        let mut hasher = DefaultHasher::new();
-        citejson.hash(&mut hasher);
-        cwd.hash(&mut hasher);
-        Some(hasher.finish())
-    } else {
-        None
-    };
+    let (bibid, citejson) = uniqueciteprocdict(&split_md, &htmlblocks, cwd).await?;
 
     // Message to be sent to browser
     let message = NewContentMessage {

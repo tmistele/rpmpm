@@ -16,7 +16,72 @@ struct ParsedBlock<'a> {
     range: core::ops::Range<usize>,
 }
 
-type Metadata = HashMap<String, serde_yaml::Value>;
+type MetadataMap = HashMap<String, serde_yaml::Value>;
+
+struct MetadataInProgress {
+    map: Option<MetadataMap>,
+    hasher: DefaultHasher,
+}
+
+impl MetadataInProgress {
+    fn new() -> Self {
+        MetadataInProgress {
+            map: None,
+            hasher: DefaultHasher::new(),
+        }
+    }
+
+    fn maybe_parse_yaml_metadata_block(&mut self, md: &str, start: usize) -> Option<usize> {
+        let (yaml_end, parsed_yaml) = try_parse_yaml_metadata_block(md, start)?;
+
+        // Add new metadata data
+        if let Some(ref mut map) = self.map {
+            // A second/third/... metadata block. Merge it into the existing one
+            for (key, value) in parsed_yaml.into_iter() {
+                map.insert(key, value);
+            }
+        } else {
+            // First metadata block, use it directly
+            self.map = Some(parsed_yaml);
+        }
+
+        // Update hash
+        md[start..std::cmp::min(yaml_end, md.len())].hash(&mut self.hasher);
+
+        Some(yaml_end)
+    }
+
+    fn finish(self) -> Metadata {
+        Metadata {
+            map: self.map.unwrap_or_default(),
+            hash: self.hasher.finish(),
+        }
+    }
+}
+
+#[derive(Clone)]
+pub struct Metadata {
+    map: MetadataMap,
+    hash: u64,
+}
+
+impl Metadata {
+    fn get(&self, key: &str) -> Option<&serde_yaml::Value> {
+        self.map.get(key)
+    }
+
+    pub fn contains_key(&self, key: &str) -> bool {
+        self.map.contains_key(key)
+    }
+
+    pub fn clone_map(&self) -> MetadataMap {
+        self.map.clone()
+    }
+
+    pub fn get_hash(&self) -> u64 {
+        self.hash
+    }
+}
 
 #[derive(Clone)]
 pub struct SplitMarkdown {
@@ -38,7 +103,7 @@ impl<'a> SplitMarkdown {
     }
 }
 
-fn try_parse_yaml_metadata_block(md: &str, start: usize) -> Option<(usize, Metadata)> {
+fn try_parse_yaml_metadata_block(md: &str, start: usize) -> Option<(usize, MetadataMap)> {
     // See https://pandoc.org/MANUAL.html#extension-yaml_metadata_block
 
     // Not enough space to even contain a ---\n---
@@ -424,7 +489,7 @@ struct Splitter<'input> {
     md: &'input str,
     offset_iter: pulldown_cmark::OffsetIter<'input, 'input>,
     titleblock: Option<String>,
-    metadata: Option<Metadata>,
+    metadata: MetadataInProgress,
     blocks: Vec<ParsedBlock<'input>>,
     level: i32,
     footnote_definitions: HashMap<CowStr<'input>, ParsedFootnote<'input>>,
@@ -462,27 +527,12 @@ impl<'input> Splitter<'input> {
             md,
             offset_iter,
             titleblock,
-            metadata: None,
+            metadata: MetadataInProgress::new(),
             blocks: Vec::new(), // TODO: capacity? guess from last one?
             level: 0,
             footnote_definitions: HashMap::new(),
             additional_reference_definitions: HashMap::new(),
         }
-    }
-
-    fn maybe_parse_yaml_metadata_block(&mut self, start: usize) -> Option<usize> {
-        let (yaml_end, parsed_yaml) = try_parse_yaml_metadata_block(self.md, start)?;
-
-        if let Some(ref mut metadata) = self.metadata {
-            // A second/third/... metadata block. Merge it into the existing one
-            for (key, value) in parsed_yaml.into_iter() {
-                metadata.insert(key, value);
-            }
-        } else {
-            // First metadata block, use it directly
-            self.metadata = Some(parsed_yaml);
-        }
-        Some(yaml_end)
     }
 
     fn split(&mut self) -> Result<()> {
@@ -684,7 +734,10 @@ impl<'input> Splitter<'input> {
 
                 Event::Rule if self.level == 0 => {
                     // A Rule may indicate a yaml metadata block
-                    if let Some(yaml_end) = self.maybe_parse_yaml_metadata_block(range.start) {
+                    if let Some(yaml_end) = self
+                        .metadata
+                        .maybe_parse_yaml_metadata_block(self.md, range.start)
+                    {
                         // Skip the parsed block
                         skip_until = yaml_end;
                     } else {
@@ -1209,7 +1262,7 @@ impl<'input> Splitter<'input> {
             .collect::<Result<Vec<_>>>()?;
 
         Ok(SplitMarkdown {
-            metadata: self.metadata.unwrap_or_default(),
+            metadata: self.metadata.finish(),
             blocks,
             titleblock: self.titleblock,
         })
@@ -1313,7 +1366,7 @@ mod tests {
         );
         assert_eq!(split_md.blocks.len(), 1);
         assert_eq!(split_md.blocks[0], "asdf4\n\n");
-        assert_eq!(split_md.metadata.len(), 0);
+        assert_eq!(split_md.metadata.map.len(), 0);
 
         let md = "%asdf1\n asdf2";
         assert_eq!(
@@ -1344,7 +1397,7 @@ mod tests {
                 [^1]: content of footnote\n\
                 \n\
                 [^4]: footnote with $x\\\\y=1$ math and stuff $\\frac12 = x$");
-        assert_eq!(split.metadata.len(), 0);
+        assert_eq!(split.metadata.map.len(), 0);
         Ok(())
     }
 
@@ -1501,7 +1554,7 @@ mod tests {
         let md = std::str::from_utf8(&md)?;
         let split = md2mdblocks(md).await?;
         assert_eq!(split.blocks.len(), 6);
-        assert_eq!(split.metadata.len(), 4);
+        assert_eq!(split.metadata.map.len(), 4);
         assert_eq!(
             split.metadata.get("title"),
             Some(&serde_yaml::Value::String("my title".to_string()))
