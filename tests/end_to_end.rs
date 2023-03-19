@@ -24,6 +24,7 @@ use rand::distributions::{Alphanumeric, DistString};
 use sha2::{Digest, Sha512};
 
 use tokio::io::AsyncWriteExt;
+use tokio::net::unix::pipe;
 
 const TOKEN_LENGTH: usize = 50;
 
@@ -197,23 +198,25 @@ impl TestServer {
         Self::new_from_command(cmd, true).await
     }
 
-    async fn open_pipe(&self) -> tokio::fs::File {
-        tokio::fs::OpenOptions::new()
-            .read(false)
-            .write(true)
-            .custom_flags(libc::O_NONBLOCK)
-            .open(self.runtime_dir.path().join("pmpm/pipe"))
-            .await
-            .expect("Could not open named pipe")
+    async fn open_pipe(&self) -> pipe::Sender {
+        loop {
+            match pipe::OpenOptions::new().open_sender(self.runtime_dir.path().join("pmpm/pipe")) {
+                Ok(tx) => break tx,
+                Err(e) if e.raw_os_error() == Some(libc::ENXIO) => {}
+                Err(e) => panic!("Could not open named pipe, {e}"),
+            }
+
+            tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        }
     }
 
-    async fn md_to_pipe_with0(pipe: &mut tokio::fs::File, md: &mut Vec<u8>) {
+    async fn md_to_pipe_with0(pipe: &mut pipe::Sender, md: &mut Vec<u8>) {
         md.push(0);
         Self::md_to_pipe(pipe, md).await;
         md.pop();
     }
 
-    async fn md_to_pipe(pipe: &mut tokio::fs::File, md: &[u8]) {
+    async fn md_to_pipe(pipe: &mut pipe::Sender, md: &[u8]) {
         let mut written = 0;
         let mut last_n = 0;
         // TODO: This is `<=` not `<` so we can catch the potential `WouldBlock` error
@@ -223,7 +226,10 @@ impl TestServer {
         while written <= md.len() {
             match pipe.write(&md[written..]).await {
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                    debug!("sleeping 10ms because of WouldBlock {} after {} bytes", e, written);
+                    debug!(
+                        "sleeping 10ms because of WouldBlock {} after {} bytes",
+                        e, written
+                    );
                     tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
 
                     // TODO: I don't understand this. But this seems to give the correct results?!
@@ -387,7 +393,7 @@ async fn generate_long_md() -> Result<Vec<u8>> {
 
 async fn do_naivebench(
     md: &mut Vec<u8>,
-    pipe: &mut tokio::fs::File,
+    pipe: &mut pipe::Sender,
     ts: &mut TestServer,
     label: &str,
 ) -> Result<()> {
@@ -416,8 +422,6 @@ async fn do_naivebench(
     // Ignore citeproc message
     let msg = ts.ws_stream.next().await.context("no websocket msg")??;
     assert!(msg.to_text()?.starts_with("{\"html"));
-
-    // tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
 
     Ok(())
 }
@@ -465,7 +469,7 @@ async fn naivebench() -> Result<()> {
 
 async fn do_pythonbench(
     md: &mut Vec<u8>,
-    pipe: &mut tokio::fs::File,
+    pipe: &mut pipe::Sender,
     ts: &mut TestServer,
     label: &str,
 ) -> Result<()> {

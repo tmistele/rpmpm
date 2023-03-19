@@ -23,6 +23,7 @@ use anyhow::{anyhow, Context, Result};
 use futures_channel::mpsc::{unbounded, UnboundedSender};
 use futures_util::{future, pin_mut, stream::TryStreamExt, StreamExt};
 
+use tokio::net::unix::pipe;
 use tokio::net::{TcpListener, TcpStream};
 use tokio_tungstenite::tungstenite::protocol::Message;
 
@@ -324,23 +325,23 @@ impl tokio_util::codec::Decoder for NewPipeContentCodec<'_> {
 }
 
 async fn monitorpipe(
-    file: Option<tokio::fs::File>,
-    pipe: PathBuf,
+    file: Option<std::fs::File>,
+    pipe_path: PathBuf,
     peer_map: PeerMap,
     queue: Queue,
     home: PathBuf,
 ) -> Result<()> {
     // Start with pre-opened file from systemd fd, if any
-    let mut file = if let Some(file) = file {
-        file
+    let mut pipe = if let Some(file) = file {
+        pipe::Receiver::from_file(file)?
     } else {
         trace!("Opening pipe from path");
-        tokio::fs::File::open(&pipe).await?
+        pipe::OpenOptions::new().open_receiver(&pipe_path)?
     };
 
     loop {
         let mut pipe_stream = tokio_util::codec::FramedRead::with_capacity(
-            file,
+            pipe,
             NewPipeContentCodec::new(&home),
             65_536,
         );
@@ -363,7 +364,7 @@ async fn monitorpipe(
         // And second: It has already-eofd by then and reusing it will just result in
         // a busy loop until the next client connects (if the EOF came about due to
         // client disconnect at least...).
-        file = tokio::fs::File::open(&pipe).await?;
+        pipe = pipe::OpenOptions::new().open_receiver(&pipe_path)?
     }
 }
 
@@ -473,7 +474,7 @@ pub async fn run(args: crate::Args) -> Result<()> {
         // If one ever were to change this function `run` to be called twice, then
         // `read_socket_activation_fds()` would not return anything since we set `unset_env`
         // to true there.
-        unsafe { tokio::fs::File::from_raw_fd(fd) }
+        unsafe { std::fs::File::from_raw_fd(fd) }
     });
     tokio::spawn(monitorpipe(
         file,
